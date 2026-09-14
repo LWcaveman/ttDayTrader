@@ -1,0 +1,65 @@
+# Byte-compiled / optimized / C-extensions
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment Variables & Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local Databases, Logs & Runtime Data
+*.db
+*.sqlite3
+*.sqlite
+*.log
+*.csv
+data/
+*.pid
+
+# Auth / Broker Session Tokens (e.g., Robinhood / OAuth caches)
+.tokens/
+*.pickle
+*.token
+
+# Distribution / Packaging
+build/
+dist/
+*.egg-info/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+*.egg
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Operating System Files
+.DS_Store
+Thumbs.db
