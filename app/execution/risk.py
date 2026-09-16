@@ -22,6 +22,7 @@ async def hydrate_positions(db):
             'entry_price': trade['entry_price'],
             'stop_loss': trade['stop_loss'],
             'target': trade['target'],
+            'unit': trade['target'] - trade['entry_price'],
             'entry_time': entry_dt
         }
     if open_trades:
@@ -120,6 +121,7 @@ async def evaluate_setup(ticker, tracker, current_price, prod_session, config, d
             'entry_price': current_price,
             'stop_loss': stop_loss,
             'target': target,
+            'unit': unit,
             'entry_time': now_dt
         }
         print(f"[{ticker}] Robinhood Buy Order Routed Successfully. Position active.")
@@ -137,13 +139,27 @@ async def check_and_execute_exit(ticker, current_price, current_dt, prod_session
     target = position['target']
     entry_time = position['entry_time']
     shares = position['shares']
+    unit = position.get('unit', target - entry_price)
+
+    # 1. Check +1.5R Breakeven Ratchet (Protects small account gains)
+    ratchet_enabled = config.get('risk_management', {}).get('ratchet_1_5r', True)
+    if ratchet_enabled and stop_loss < entry_price:
+        halfway_target = entry_price + (unit * 0.5)  # halfway to 3R = +1.5R
+        if current_price >= halfway_target:
+            position['stop_loss'] = entry_price
+            stop_loss = entry_price
+            print(f"[{ticker}] RATCHET ACTIVATED: Price reached +1.5R (${current_price:.2f} >= ${halfway_target:.2f}). Stop moved to Breakeven (${entry_price:.2f}).")
+            try:
+                await db.update_stop_loss(ticker, entry_price)
+            except Exception as e:
+                print(f"[{ticker}] Warning: Failed to persist ratcheted stop to DB: {e}")
 
     exit_reason = None
 
     if current_price >= target:
         exit_reason = "TARGET_3R"
     elif current_price <= stop_loss:
-        exit_reason = "STOP_LOSS"
+        exit_reason = "BREAKEVEN" if abs(stop_loss - entry_price) < 0.02 else "STOP_LOSS"
     else:
         elapsed_minutes = (current_dt - entry_time).total_seconds() / 60.0
         time_stop_limit = config['risk_management'].get('time_stop_minutes', 15)

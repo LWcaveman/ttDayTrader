@@ -79,7 +79,9 @@ async def start_market_stream(prod_session, cert_session, active_tickers, config
 
             # 2. Entry Evaluation (Now passing prod_session)
             if is_within_trading_window(config) and len(active_positions) < 1:
-                if tracker.check_crossover(current_price=price):
+                min_close = float(config.get('execution', {}).get('min_close_pct', 0.60))
+                min_vol = float(config.get('execution', {}).get('min_vol_ratio', 0.80))
+                if tracker.check_crossover(current_price=price, min_close_pct=min_close, min_vol_ratio=min_vol):
                     print(f"[CROSS DETECTED] {ticker} | Price: {price:.2f} | VWAP: {tracker.vwap:.2f} | 9EMA: {tracker.ema_9:.2f}")
                     await evaluate_setup(
                         ticker=ticker,

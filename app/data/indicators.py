@@ -24,6 +24,13 @@ class IntradayTracker:
         self.current_low = float('inf')
         self.current_close = 0.0
         self.current_vol = 0.0
+
+        # Last Completed 1-Minute Candle (for edge confirmation filters)
+        self.last_candle_high = 0.0
+        self.last_candle_low = 0.0
+        self.last_candle_close = 0.0
+        self.last_candle_vol = 0.0
+        self.recent_volumes = []
         
         # Daily SMA constraint variables
         self.sma_5 = 0.0
@@ -89,6 +96,14 @@ class IntradayTracker:
                 self.prev_ema_9 = self.ema_9
                 self.prev_vwap = self.vwap
 
+            # Populate last completed candle and rolling 10-bar volumes for edge filters
+            self.recent_volumes = [float(v) for v in today_df['Volume'].iloc[-10:].tolist()]
+            last_row = today_df.iloc[-1]
+            self.last_candle_high = float(last_row['High'])
+            self.last_candle_low = float(last_row['Low'])
+            self.last_candle_close = float(last_row['Close'])
+            self.last_candle_vol = float(last_row['Volume'])
+
             self.is_ready = True
             return True
             
@@ -136,6 +151,15 @@ class IntradayTracker:
 
     def _finalize_candle(self):
         """Calculates indicators on the completed 1m candle."""
+        self.last_candle_high = self.current_high
+        self.last_candle_low = self.current_low
+        self.last_candle_close = self.current_close
+        self.last_candle_vol = self.current_vol
+
+        self.recent_volumes.append(float(self.current_vol))
+        if len(self.recent_volumes) > 10:
+            self.recent_volumes.pop(0)
+
         self.prev_ema_9 = self.ema_9
         self.prev_vwap = self.vwap
         
@@ -151,9 +175,10 @@ class IntradayTracker:
         k = 2.0 / (9.0 + 1.0)
         self.ema_9 = (self.current_close - self.prev_ema_9) * k + self.prev_ema_9
 
-    def check_crossover(self, current_price):
+    def check_crossover(self, current_price, min_close_pct=0.60, min_vol_ratio=0.80):
         """
-        Evaluates the crossing constraint and the daily pullback constraint natively.
+        Evaluates the crossing constraint, the daily pullback constraint,
+        plus the bullish candle close and volume participation edge filters.
         """
         if self.prev_ema_9 == 0.0 or self.prev_vwap == 0.0:
             return False
@@ -162,8 +187,25 @@ class IntradayTracker:
         clean_slope = self.ema_9 > self.prev_ema_9
         
         if cross_up and clean_slope:
+            # 1. Daily SMA Pullback Context
             near_5 = abs(current_price - self.sma_5) / self.sma_5 < 0.03 if self.sma_5 else False
             near_10 = abs(current_price - self.sma_10) / self.sma_10 < 0.03 if self.sma_10 else False
-            return near_5 or near_10
+            if not (near_5 or near_10):
+                return False
+
+            # 2. Bullish Close Filter (Must close in upper 40% of candle, rejecting topping wicks)
+            if self.last_candle_high > self.last_candle_low:
+                c_range = self.last_candle_high - self.last_candle_low
+                close_pct = (self.last_candle_close - self.last_candle_low) / c_range
+                if close_pct < min_close_pct:
+                    return False
+
+            # 3. Volume Participation Filter (>= min_vol_ratio x 10-bar SMA)
+            if len(self.recent_volumes) >= 5:
+                vol_sma = sum(self.recent_volumes) / len(self.recent_volumes)
+                if vol_sma > 0 and (self.last_candle_vol / vol_sma) < min_vol_ratio:
+                    return False
+
+            return True
             
         return False

@@ -25,7 +25,7 @@ venv.bak/
 *.sqlite
 *.log
 *.csv
-data/
+/data/
 *.pid
 auto_start.sh
 
