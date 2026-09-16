@@ -27,6 +27,7 @@ venv.bak/
 *.csv
 data/
 *.pid
+auto_start.sh
 
 # Auth / Broker Session Tokens (e.g., Robinhood / OAuth caches)
 .tokens/

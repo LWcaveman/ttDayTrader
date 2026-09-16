@@ -6,3 +6,4 @@ pyyaml
 python-dotenv
 aiosqlite
 lxml
+robin-stocks
