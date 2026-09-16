@@ -1,0 +1,834 @@
+
+
+========================================
+FILE: ./app/__init__.py
+========================================
+
+
+========================================
+FILE: ./app/main.py
+========================================
+import asyncio
+import yaml
+from dotenv import load_dotenv
+from app.auth.session import get_sessions
+from app.scanner.premarket import run_screener
+from app.data.stream import start_market_stream
+from app.state.db import StateManager
+from app.execution.rh_router import login_robinhood
+
+async def main():
+    print("Initializing Fashionably Late Daemon...")
+    
+    load_dotenv()
+    with open("config.yaml", "r") as file:
+        config = yaml.safe_load(file)
+        
+    db = StateManager()
+    await db.initialize_db()
+    
+    prod_session, cert_session = get_sessions()
+    if not prod_session:
+        print("CRITICAL: No production session available for Market Data. Exiting...")
+        return
+        
+    active_tickers = run_screener()
+    if not active_tickers:
+        print("No eligible tickers for today. Shutting down daemon.")
+        return
+        
+    print("Authenticating Robinhood Execution Engine...")
+    await login_robinhood()
+    
+    await start_market_stream(prod_session, cert_session, active_tickers, config, db)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+========================================
+FILE: ./app/data/stream.py
+========================================
+import asyncio
+import concurrent.futures
+from datetime import datetime
+import pytz
+from tastytrade import DXLinkStreamer
+from tastytrade.dxfeed import Trade
+from app.data.indicators import IntradayTracker
+from app.execution.risk import (
+    active_positions,
+    hydrate_positions,
+    evaluate_setup,
+    check_and_execute_exit
+)
+from app.scanner.premarket import is_within_trading_window
+
+def _bootstrap_single_tracker(ticker):
+    tracker = IntradayTracker(ticker)
+    if tracker.bootstrap_today():
+        return tracker
+    return None
+
+async def start_market_stream(prod_session, cert_session, active_tickers, config, db):
+    await hydrate_positions(db)
+    
+    monitored_tickers = list(set(active_tickers + list(active_positions.keys())))
+    
+    print(f"Bootstrapping {len(monitored_tickers)} trackers using 20 concurrent threads (this should take ~15 seconds)...")
+    trackers = {}
+    
+    loop = asyncio.get_running_loop()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as pool:
+        futures = [
+            loop.run_in_executor(pool, _bootstrap_single_tracker, ticker)
+            for ticker in monitored_tickers
+        ]
+        
+        results = await asyncio.gather(*futures)
+        
+        for tracker in results:
+            if tracker:
+                trackers[tracker.ticker] = tracker
+
+    active_tickers = list(trackers.keys())
+    if not active_tickers:
+        print("No tickers bootstrapped successfully. Exiting.")
+        return
+
+    print(f"Successfully bootstrapped {len(active_tickers)} tickers.")
+    print("Connecting to DXLink WebSocket...")
+    tz = pytz.timezone('America/New_York')
+
+    async with DXLinkStreamer(prod_session) as streamer:
+        await streamer.subscribe(Trade, active_tickers)
+        print("Data stream active. Monitoring 1-minute aggregations for crossovers...")
+
+        async for trade_event in streamer.listen(Trade):
+            ticker = trade_event.event_symbol
+            price = float(trade_event.price)
+            volume = float(getattr(trade_event, 'size', 1.0) or 1.0)
+            now_dt = datetime.now(tz)
+
+            if ticker not in trackers:
+                continue
+
+            tracker = trackers[ticker]
+            tracker.update_tick(price, volume, now_dt)
+
+            # 1. Exit Evaluation (Now passing prod_session)
+            if ticker in active_positions:
+                await check_and_execute_exit(
+                    ticker=ticker,
+                    current_price=price,
+                    current_dt=now_dt,
+                    prod_session=prod_session,
+                    config=config,
+                    db=db
+                )
+                continue
+
+            # 2. Entry Evaluation (Now passing prod_session)
+            if is_within_trading_window(config) and len(active_positions) < 1:
+                if tracker.check_crossover(current_price=price):
+                    print(f"[CROSS DETECTED] {ticker} | Price: {price:.2f} | VWAP: {tracker.vwap:.2f} | 9EMA: {tracker.ema_9:.2f}")
+                    await evaluate_setup(
+                        ticker=ticker,
+                        tracker=tracker,
+                        current_price=price,
+                        prod_session=prod_session,
+                        config=config,
+                        db=db
+                    )
+
+========================================
+FILE: ./app/data/indicators.py
+========================================
+import pandas as pd
+import yfinance as yf
+from datetime import datetime
+import pytz
+
+class IntradayTracker:
+    def __init__(self, ticker):
+        self.ticker = ticker
+        
+        # Core State
+        self.vwap = 0.0
+        self.ema_9 = 0.0
+        self.prev_ema_9 = 0.0
+        self.prev_vwap = 0.0
+        self.lod = float('inf')
+        
+        # Cumulative VWAP state
+        self.cum_vol = 0.0
+        self.cum_vol_x_tp = 0.0
+        
+        # Current Aggregating 1-Minute Candle
+        self.current_minute = None
+        self.current_high = -float('inf')
+        self.current_low = float('inf')
+        self.current_close = 0.0
+        self.current_vol = 0.0
+        
+        # Daily SMA constraint variables
+        self.sma_5 = 0.0
+        self.sma_10 = 0.0
+        
+        self.is_ready = False
+        
+    def bootstrap_today(self):
+        """
+        Fetches today's historical 1m data up to this exact minute to align 
+        the LOD, VWAP, and EMA_9 baseline perfectly with the backtester.
+        """
+        try:
+            # 1. Get Daily SMAs to enforce pulling back rule at time of execution
+            daily_df = yf.download(self.ticker, period="20d", interval="1d", progress=False)
+            if not daily_df.empty:
+                if isinstance(daily_df.columns, pd.MultiIndex):
+                     daily_df.columns = daily_df.columns.get_level_values(0)
+                # Shift by 1 to compare against yesterday's close, exactly like backtester
+                daily_df['SMA_5'] = daily_df['Close'].rolling(5).mean().shift(1)
+                daily_df['SMA_10'] = daily_df['Close'].rolling(10).mean().shift(1)
+                self.sma_5 = daily_df['SMA_5'].iloc[-1]
+                self.sma_10 = daily_df['SMA_10'].iloc[-1]
+
+            # 2. Bootstrap Intraday Indicators
+            df = yf.download(self.ticker, period="5d", interval="1m", progress=False)
+            if df.empty:
+                return False
+                
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+                
+            df = df.tz_convert('America/New_York')
+            df['EMA_9'] = df['Close'].ewm(span=9, adjust=False).mean()
+            
+            # Isolate Today
+            today = datetime.now(pytz.timezone('America/New_York')).date()
+            today_df = df[df.index.date == today].copy()
+            
+            if today_df.empty:
+                # Pre-market or exact open. Fallback to yesterday's values
+                self.ema_9 = df['EMA_9'].iloc[-1]
+                self.prev_ema_9 = df['EMA_9'].iloc[-2] if len(df) > 1 else self.ema_9
+                self.is_ready = True
+                return True
+                
+            today_df['Typical_Price'] = (today_df['High'] + today_df['Low'] + today_df['Close']) / 3.0
+            today_df['Vol_x_TP'] = today_df['Typical_Price'] * today_df['Volume']
+            
+            self.cum_vol = today_df['Volume'].sum()
+            self.cum_vol_x_tp = today_df['Vol_x_TP'].sum()
+            
+            self.vwap = self.cum_vol_x_tp / self.cum_vol if self.cum_vol > 0 else 0.0
+            self.ema_9 = today_df['EMA_9'].iloc[-1]
+            self.lod = today_df['Low'].min()
+            
+            if len(today_df) > 1:
+                self.prev_ema_9 = today_df['EMA_9'].iloc[-2]
+                prev_cum_vol = today_df['Volume'].iloc[:-1].sum()
+                prev_cum_vol_x_tp = today_df['Vol_x_TP'].iloc[:-1].sum()
+                self.prev_vwap = prev_cum_vol_x_tp / prev_cum_vol if prev_cum_vol > 0 else 0.0
+            else:
+                self.prev_ema_9 = self.ema_9
+                self.prev_vwap = self.vwap
+
+            self.is_ready = True
+            return True
+            
+        except Exception as e:
+            print(f"Error bootstrapping {self.ticker}: {e}")
+            return False
+
+    def update_tick(self, price, volume, dt_ny):
+        """
+        Aggregates live stream ticks into 1-minute bars, calculating VWAP 
+        and EMA at the close of each minute.
+        """
+        if not self.is_ready:
+            return
+            
+        tick_minute = dt_ny.replace(second=0, microsecond=0)
+        
+        if self.current_minute is None:
+            self.current_minute = tick_minute
+            self.current_high = price
+            self.current_low = price
+            self.current_close = price
+            self.current_vol = volume
+            return
+            
+        # Minute Rollover - Finalize previous candle
+        if tick_minute > self.current_minute:
+            self._finalize_candle()
+            # Start new candle
+            self.current_minute = tick_minute
+            self.current_high = price
+            self.current_low = price
+            self.current_vol = volume
+            self.current_close = price
+        else:
+            # Update Developing Candle
+            if price > self.current_high: self.current_high = price
+            if price < self.current_low: self.current_low = price
+            self.current_close = price
+            self.current_vol += volume
+
+        # Dynamic Low of Day tracker
+        if price < self.lod:
+            self.lod = price
+
+    def _finalize_candle(self):
+        """Calculates indicators on the completed 1m candle."""
+        self.prev_ema_9 = self.ema_9
+        self.prev_vwap = self.vwap
+        
+        # 1. VWAP
+        tp = (self.current_high + self.current_low + self.current_close) / 3.0
+        self.cum_vol += self.current_vol
+        self.cum_vol_x_tp += (tp * self.current_vol)
+        
+        if self.cum_vol > 0:
+            self.vwap = self.cum_vol_x_tp / self.cum_vol
+            
+        # 2. EMA 9
+        k = 2.0 / (9.0 + 1.0)
+        self.ema_9 = (self.current_close - self.prev_ema_9) * k + self.prev_ema_9
+
+    def check_crossover(self, current_price):
+        """
+        Evaluates the crossing constraint and the daily pullback constraint natively.
+        """
+        if self.prev_ema_9 == 0.0 or self.prev_vwap == 0.0:
+            return False
+            
+        cross_up = (self.ema_9 > self.vwap) and (self.prev_ema_9 <= self.prev_vwap)
+        clean_slope = self.ema_9 > self.prev_ema_9
+        
+        if cross_up and clean_slope:
+            near_5 = abs(current_price - self.sma_5) / self.sma_5 < 0.03 if self.sma_5 else False
+            near_10 = abs(current_price - self.sma_10) / self.sma_10 < 0.03 if self.sma_10 else False
+            return near_5 or near_10
+            
+        return False
+
+========================================
+FILE: ./app/state/db.py
+========================================
+import aiosqlite
+from datetime import datetime
+import pytz
+
+DB_PATH = "ttdaytrader_state.db"
+
+class StateManager:
+    def __init__(self, db_path=DB_PATH):
+        self.db_path = db_path
+
+    async def initialize_db(self):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS portfolio (
+                    id INTEGER PRIMARY KEY,
+                    settled_cash REAL,
+                    locked_cash REAL
+                )
+            ''')
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS active_positions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker TEXT NOT NULL,
+                    shares REAL NOT NULL,
+                    entry_price REAL NOT NULL,
+                    stop_loss REAL NOT NULL,
+                    target REAL NOT NULL,
+                    entry_time TEXT NOT NULL,
+                    status TEXT DEFAULT 'OPEN',
+                    exit_price REAL,
+                    exit_time TEXT,
+                    exit_reason TEXT,
+                    realized_pnl REAL
+                )
+            ''')
+            async with db.execute('SELECT count(*) FROM portfolio') as cursor:
+                row = await cursor.fetchone()
+                if row[0] == 0:
+                    await db.execute(
+                        'INSERT INTO portfolio (settled_cash, locked_cash) VALUES (?, ?)',
+                        (1000.0, 0.0)
+                    )
+            await db.commit()
+
+    async def get_trades_count_today(self):
+        """Counts how many trades have been opened today for the scaling limit."""
+        tz = pytz.timezone('America/New_York')
+        today_str = datetime.now(tz).strftime('%Y-%m-%d')
+        
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute('''
+                SELECT count(*) FROM active_positions 
+                WHERE entry_time LIKE ?
+            ''', (today_str + '%',)) as cursor:
+                row = await cursor.fetchone()
+                return row[0] if row else 0
+
+    async def get_available_cash(self):
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute('SELECT settled_cash FROM portfolio WHERE id = 1') as cursor:
+                row = await cursor.fetchone()
+                return row[0] if row else 0.0
+
+    async def check_settled_cash_available(self):
+        cash = await self.get_available_cash()
+        return cash > 10.00
+
+    async def lock_capital(self, amount: float):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('''
+                UPDATE portfolio 
+                SET settled_cash = settled_cash - ?, locked_cash = locked_cash + ? 
+                WHERE id = 1
+            ''', (amount, amount))
+            await db.commit()
+
+    async def release_capital(self, amount: float):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('''
+                UPDATE portfolio 
+                SET settled_cash = settled_cash + ?, locked_cash = locked_cash - ? 
+                WHERE id = 1
+            ''', (amount, amount))
+            await db.commit()
+
+    async def open_position(self, ticker: str, shares: float, entry_price: float, stop_loss: float, target: float, entry_time: str):
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute('''
+                INSERT INTO active_positions (ticker, shares, entry_price, stop_loss, target, entry_time, status)
+                VALUES (?, ?, ?, ?, ?, ?, 'OPEN')
+            ''', (ticker, shares, entry_price, stop_loss, target, entry_time))
+            await db.commit()
+            return cursor.lastrowid
+
+    async def close_position(self, ticker: str, exit_price: float, exit_time: str, exit_reason: str, realized_pnl: float, cost_basis: float, proceeds: float):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('''
+                UPDATE active_positions
+                SET status = 'CLOSED',
+                    exit_price = ?,
+                    exit_time = ?,
+                    exit_reason = ?,
+                    realized_pnl = ?
+                WHERE ticker = ? AND status = 'OPEN'
+            ''', (exit_price, exit_time, exit_reason, realized_pnl, ticker))
+
+            await db.execute('''
+                UPDATE portfolio
+                SET locked_cash = MAX(0.0, locked_cash - ?),
+                    settled_cash = settled_cash + ?
+                WHERE id = 1
+            ''', (cost_basis, proceeds))
+            await db.commit()
+
+    async def get_open_positions(self):
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute('''
+                SELECT id, ticker, shares, entry_price, stop_loss, target, entry_time, status
+                FROM active_positions
+                WHERE status = 'OPEN'
+            ''') as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+
+========================================
+FILE: ./app/auth/session.py
+========================================
+import os
+from tastytrade import Session
+
+def get_sessions():
+    """
+    Returns (prod_session, cert_session) using Tastytrade's OAuth2 authentication.
+    """
+    # Production
+    prod_secret = os.getenv("TT_PROD_CLIENT_SECRET")
+    prod_refresh = os.getenv("TT_PROD_REFRESH_TOKEN")
+    
+    # Certification (Sandbox)
+    cert_secret = os.getenv("TT_CERT_CLIENT_SECRET")
+    cert_refresh = os.getenv("TT_CERT_REFRESH_TOKEN")
+    
+    prod_session = None
+    cert_session = None
+    
+    if prod_secret and prod_refresh:
+        print("Authenticating Production Session (Market Data) via OAuth...")
+        # FIX: Changed client_secret to provider_secret
+        prod_session = Session(provider_secret=prod_secret, refresh_token=prod_refresh)
+        
+    if cert_secret and cert_refresh:
+        print("Authenticating Certification Session (Sandbox Orders) via OAuth...")
+        # FIX: Changed client_secret to provider_secret
+        cert_session = Session(
+            provider_secret=cert_secret, 
+            refresh_token=cert_refresh, 
+            is_test=True
+        )
+        
+    return prod_session, cert_session
+
+========================================
+FILE: ./app/scanner/premarket.py
+========================================
+import pandas as pd
+import yfinance as yf
+from datetime import datetime
+import pytz
+import urllib.request
+import io
+
+def get_sp500_tickers():
+    """
+    Dynamically fetches the current S&P 500 index ticker list.
+    Includes multiple fallbacks to ensure the daemon never crashes on boot.
+    """
+    print("Fetching the current S&P 500 universe...")
+    
+    # 1. Primary Source: Reliable CSV Repo (Fastest, zero HTML parsing)
+    try:
+        url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv"
+        df = pd.read_csv(url)
+        tickers = df['Symbol'].str.replace('.', '-', regex=False).tolist()
+        return tickers
+    except Exception as e:
+        print(f"Primary source failed ({e}). Falling back to Wikipedia...")
+
+    # 2. Secondary Source: Wikipedia (Wrapped in StringIO to prevent HTML dumps)
+    try:
+        url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
+        req = urllib.request.Request(
+            url, 
+            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0'}
+        )
+        with urllib.request.urlopen(req) as response:
+            html = response.read().decode('utf-8')
+            
+        # io.StringIO prevents Pandas from printing the raw HTML if a ValueError occurs
+        tables = pd.read_html(io.StringIO(html))
+        df = tables[0]
+        tickers = df['Symbol'].str.replace('.', '-', regex=False).tolist()
+        return tickers
+    except Exception as e:
+        print(f"Wikipedia fallback failed ({e}).")
+        
+    # 3. Emergency Source: Top High-Liquidity Momentum Tickers
+    print("WARNING: Using emergency hard-coded ticker list to keep daemon running.")
+    return [
+        "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "GOOG", "TSLA", 
+        "AVGO", "JPM", "LLY", "V", "UNH", "XOM", "MA", "JNJ", "PG", "HD", 
+        "COST", "MRK", "ABBV", "CVX", "CRM", "AMD", "NFLX", "PEP", "KO", 
+        "BAC", "WMT", "TMO", "LIN", "MCD", "ACN", "CSCO", "ABT", "INTC", 
+        "QCOM", "INTU", "VZ", "CMCSA", "IBM", "DHR", "TXN", "AMGN", "NOW"
+    ]
+
+def run_screener():
+    """
+    Scans the entire S&P 500 for stocks that closed yesterday
+    within 3% of their 5 SMA or 10 SMA.
+    """
+    universe = get_sp500_tickers()
+    print(f"Running pre-market daily SMA screener for {len(universe)} tickers...")
+    valid_tickers = []
+    
+    try:
+        # Batch download is exponentially faster than looping single tickers
+        data = yf.download(universe, period="20d", interval="1d", progress=False)
+        close_prices = data['Close']
+        
+        for ticker in universe:
+            if ticker not in close_prices.columns:
+                continue
+                
+            series = close_prices[ticker].dropna()
+            if len(series) < 10:
+                continue
+                
+            sma5 = series.rolling(window=5).mean().iloc[-1]
+            sma10 = series.rolling(window=10).mean().iloc[-1]
+            last_close = series.iloc[-1]
+            
+            near_5 = abs(last_close - sma5) / sma5 < 0.03
+            near_10 = abs(last_close - sma10) / sma10 < 0.03
+            
+            if near_5 or near_10:
+                valid_tickers.append(ticker)
+                
+    except Exception as e:
+        print(f"Error during batch screening: {e}")
+            
+    print(f"Screener finished. {len(valid_tickers)} tickers eligible for intraday scanning today.")
+    return valid_tickers
+
+def is_within_trading_window(config):
+    tz = pytz.timezone('America/New_York')
+    now = datetime.now(tz).time()
+    
+    for window in config['execution']['trading_windows']:
+        start = datetime.strptime(window['start'], "%H:%M").time()
+        end = datetime.strptime(window['end'], "%H:%M").time()
+        if start <= now <= end:
+            return True
+    return False
+
+========================================
+FILE: ./app/execution/rh_router.py
+========================================
+import robin_stocks.robinhood as rh
+import asyncio
+import os
+
+def _sync_login():
+    """Authenticates with Robinhood using env variables or cached token."""
+    # Updated to perfectly match your .env variables from rhTrader
+    rh_user = os.environ.get('RH_USERNAME')
+    rh_pass = os.environ.get('RH_PASSWORD')
+    
+    # If MFA is required, robin_stocks will automatically pause here 
+    # and prompt you to type the SMS code directly into the terminal.
+    if rh_user and rh_pass:
+        rh.login(username=rh_user, password=rh_pass, store_session=True)
+    else:
+        # Fallback to cached pickle file in ~/.tokens/robinhood.pickle
+        rh.login(store_session=True)
+    print("[Robinhood] Execution Engine Authenticated.")
+
+def _sync_get_buying_power():
+    """Fetches real-time cash balance from Robinhood."""
+    profile = rh.profiles.load_account_profile(info='buying_power')
+    return float(profile) if profile else 0.0
+
+def _sync_route_order(ticker, shares, action):
+    """Executes a live fractional market order via Robinhood."""
+    if action == "BUY":
+        res = rh.orders.order_buy_fractional_by_quantity(ticker, shares)
+    else:
+        res = rh.orders.order_sell_fractional_by_quantity(ticker, shares)
+    
+    # Catch Robinhood's internal error dicts
+    if type(res) is dict and ('error' in res or 'detail' in res):
+        raise Exception(f"Robinhood Rejected: {res.get('error', res.get('detail'))}")
+    return res
+
+# --- Async Wrappers to protect the Tastytrade WebSocket thread ---
+
+async def login_robinhood():
+    await asyncio.to_thread(_sync_login)
+
+async def get_rh_buying_power():
+    return await asyncio.to_thread(_sync_get_buying_power)
+
+async def route_rh_market_order(ticker, shares, action="BUY"):
+    return await asyncio.to_thread(_sync_route_order, ticker, shares, action)
+
+========================================
+FILE: ./app/execution/risk.py
+========================================
+import asyncio
+from datetime import datetime, time
+import pytz
+
+# NEW ROBINHOOD IMPORTS
+from app.execution.rh_router import get_rh_buying_power, route_rh_market_order
+
+active_positions = {}
+rejected_cooldowns = set()
+
+async def hydrate_positions(db):
+    """Loads open positions from SQLite into memory on daemon boot."""
+    open_trades = await db.get_open_positions()
+    tz = pytz.timezone('America/New_York')
+    for trade in open_trades:
+        ticker = trade['ticker']
+        entry_dt = datetime.fromisoformat(trade['entry_time'])
+        if entry_dt.tzinfo is None:
+            entry_dt = tz.localize(entry_dt)
+        active_positions[ticker] = {
+            'shares': trade['shares'],
+            'entry_price': trade['entry_price'],
+            'stop_loss': trade['stop_loss'],
+            'target': trade['target'],
+            'entry_time': entry_dt
+        }
+    if open_trades:
+        print(f"[RECOVERY] Hydrated {len(open_trades)} active positions from SQLite.")
+
+async def evaluate_setup(ticker, tracker, current_price, prod_session, config, db):
+    if len(active_positions) >= 1 or ticker in active_positions:
+        return
+
+    if ticker in rejected_cooldowns:
+        return
+
+    lod = tracker.lod
+    if current_price <= lod:
+        return
+
+    # FETCH LIVE BALANCE FROM ROBINHOOD
+    raw_buying_power = await get_rh_buying_power()
+    buying_power = raw_buying_power * 0.95 
+
+    trades_today = await db.get_trades_count_today()
+    if raw_buying_power < 100.00:
+        max_trades = 1
+    elif raw_buying_power < 300.00:
+        max_trades = 2
+    else:
+        max_trades = 3
+
+    if trades_today >= max_trades:
+        print(f"[{ticker}] Passed: Daily trade limit ({max_trades}) reached for account size (${raw_buying_power:.2f}).")
+        rejected_cooldowns.add(ticker)
+        return
+
+    unit = current_price - lod
+    target = current_price + unit
+    stop_loss = current_price - (unit / 3.0)
+
+    risk_pct = config['risk_management']['risk_pct_per_trade']
+    max_risk = config['risk_management']['max_risk_dollars']
+    risk_dollars = min(buying_power * risk_pct, max_risk)
+
+    stop_distance = current_price - stop_loss
+    if stop_distance <= 0:
+        return
+
+    shares = round(risk_dollars / stop_distance, 4)
+    cost_basis = round(shares * current_price, 2)
+
+    # Note: Removed the $5.00 Tastytrade minimum limit here since RH allows micro-fractionals
+    if cost_basis > buying_power:
+        shares = round(buying_power / current_price, 4)
+        cost_basis = round(shares * current_price, 2)
+        if cost_basis <= 0:
+            return
+
+    print(f"[{ticker}] Setup Detected: Entry ${current_price:.2f} | Target ${target:.2f} | Stop ${stop_loss:.2f}")
+    print(f"[{ticker}] Executing {shares} shares via ROBINHOOD (${cost_basis:.2f})...")
+
+    tz = pytz.timezone('America/New_York')
+    now_dt = datetime.now(tz)
+
+    try:
+        # EXECUTE BUY VIA ROBINHOOD
+        await route_rh_market_order(ticker, shares, action="BUY")
+
+        await db.open_position(
+            ticker=ticker,
+            shares=shares,
+            entry_price=current_price,
+            stop_loss=stop_loss,
+            target=target,
+            entry_time=now_dt.isoformat()
+        )
+
+        active_positions[ticker] = {
+            'shares': shares,
+            'entry_price': current_price,
+            'stop_loss': stop_loss,
+            'target': target,
+            'entry_time': now_dt
+        }
+        print(f"[{ticker}] Robinhood Buy Order Routed Successfully. Position active.")
+    except Exception as e:
+        print(f"[{ticker}] Robinhood Order Failed: {e}")
+        rejected_cooldowns.add(ticker) 
+
+async def check_and_execute_exit(ticker, current_price, current_dt, prod_session, config, db):
+    position = active_positions.get(ticker)
+    if not position:
+        return
+
+    entry_price = position['entry_price']
+    stop_loss = position['stop_loss']
+    target = position['target']
+    entry_time = position['entry_time']
+    shares = position['shares']
+
+    exit_reason = None
+
+    if current_price >= target:
+        exit_reason = "TARGET_3R"
+    elif current_price <= stop_loss:
+        exit_reason = "STOP_LOSS"
+    else:
+        elapsed_minutes = (current_dt - entry_time).total_seconds() / 60.0
+        time_stop_limit = config['risk_management'].get('time_stop_minutes', 15)
+        progress_factor = config['risk_management'].get('chop_progress_threshold', 0.3)
+
+        if elapsed_minutes >= time_stop_limit:
+            progress_threshold = entry_price + ((target - entry_price) * progress_factor)
+            if current_price < progress_threshold:
+                exit_reason = "CHOP_TIME_STOP"
+
+    if not exit_reason and current_dt.time() >= time(15, 58):
+        exit_reason = "EOD_EXIT"
+
+    if not exit_reason:
+        return
+
+    del active_positions[ticker]
+    print(f"[{ticker}] Exit Triggered: {exit_reason} at ${current_price:.2f}")
+
+    cost_basis = round(shares * entry_price, 2)
+    proceeds = round(shares * current_price, 2)
+    realized_pnl = round(proceeds - cost_basis, 2)
+
+    try:
+        # EXECUTE SELL VIA ROBINHOOD
+        await route_rh_market_order(ticker, shares, action="SELL")
+        await db.close_position(
+            ticker=ticker,
+            exit_price=current_price,
+            exit_time=current_dt.isoformat(),
+            exit_reason=exit_reason,
+            realized_pnl=realized_pnl,
+            cost_basis=cost_basis,
+            proceeds=proceeds
+        )
+        print(f"[{ticker}] Closed {shares} shares | PnL: ${realized_pnl:+.2f} ({exit_reason})")
+    except Exception as e:
+        print(f"[{ticker}] CRITICAL: Failed to route SELL order via Robinhood: {e}")
+        active_positions[ticker] = position
+
+========================================
+FILE: ./app/execution/fractional_router.py
+========================================
+import math
+from tastytrade import Account
+from tastytrade.instruments import Equity
+from tastytrade.order import MarketOrder, OrderAction
+
+async def route_fractional_market_order(prod_session, ticker, total_shares, action="BUY"):
+    if not prod_session:
+        raise ValueError("Production session required for live routing.")
+        
+    account = (await Account.get(prod_session))[0]
+    symbol = await Equity.get(prod_session, ticker)
+    
+    whole_shares = math.floor(total_shares)
+    fractional_shares = round(total_shares - whole_shares, 4)
+    
+    order_action = OrderAction.BUY_TO_OPEN if action == "BUY" else OrderAction.SELL_TO_CLOSE
+    
+    # Send Whole Shares Payload
+    if whole_shares > 0:
+        leg_whole = symbol.build_leg(whole_shares, order_action)
+        order_whole = MarketOrder(legs=[leg_whole])
+        await account.place_order(prod_session, order_whole, dry_run=False)
+        
+    # Send Fractional Payload immediately after
+    if fractional_shares > 0:
+        leg_fractional = symbol.build_leg(fractional_shares, order_action)
+        order_fractional = MarketOrder(legs=[leg_fractional])
+        await account.place_order(prod_session, order_fractional, dry_run=False)

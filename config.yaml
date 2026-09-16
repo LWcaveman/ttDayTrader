@@ -1,0 +1,12 @@
+risk_management:
+  risk_pct_per_trade: 0.02
+  max_risk_dollars: 10.00
+  time_stop_minutes: 15
+  chop_progress_threshold: 0.3
+
+execution:
+  environment: "prod" 
+  trading_windows:
+    - start: "10:00"
+      end: "13:30"
+

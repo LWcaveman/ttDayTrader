@@ -1,0 +1,8 @@
+tastytrade>=9.0.0
+pandas
+numpy
+yfinance
+pyyaml
+python-dotenv
+aiosqlite
+lxml
