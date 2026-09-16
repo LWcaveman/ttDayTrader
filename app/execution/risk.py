@@ -43,7 +43,10 @@ async def evaluate_setup(ticker, tracker, current_price, prod_session, config, d
     buying_power = raw_buying_power * 0.95 
 
     trades_today = await db.get_trades_count_today()
-    if raw_buying_power < 100.00:
+    max_trades_cfg = config.get('risk_management', {}).get('max_trades_per_day')
+    if max_trades_cfg is not None:
+        max_trades = int(max_trades_cfg)
+    elif raw_buying_power < 100.00:
         max_trades = 1
     elif raw_buying_power < 300.00:
         max_trades = 2
@@ -51,11 +54,27 @@ async def evaluate_setup(ticker, tracker, current_price, prod_session, config, d
         max_trades = 3
 
     if trades_today >= max_trades:
-        print(f"[{ticker}] Passed: Daily trade limit ({max_trades}) reached for account size (${raw_buying_power:.2f}).")
+        print(f"[{ticker}] Passed: Daily trade limit ({max_trades}) reached. Staying in cash.")
         rejected_cooldowns.add(ticker)
         return
 
     unit = current_price - lod
+    unit_pct = (unit / current_price) if current_price > 0 else 1.0
+
+    # Morning vs Midday Execution Filter
+    tz = pytz.timezone('America/New_York')
+    now_time = datetime.now(tz).time()
+
+    morning_cutoff_str = config.get('execution', {}).get('morning_cutoff', '10:45')
+    morning_cutoff = datetime.strptime(morning_cutoff_str, "%H:%M").time()
+
+    if now_time > morning_cutoff:
+        max_midday_unit = float(config.get('execution', {}).get('midday_max_unit_pct', 0.0075))
+        if unit_pct > max_midday_unit:
+            print(f"[{ticker}] Passed: Midday entry unit ({unit_pct*100:.2f}%) exceeds tight threshold ({max_midday_unit*100:.2f}%). Staying in cash.")
+            rejected_cooldowns.add(ticker)
+            return
+
     target = current_price + unit
     stop_loss = current_price - (unit / 3.0)
 

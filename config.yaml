@@ -1,6 +1,7 @@
 risk_management:
   risk_pct_per_trade: 0.02
   max_risk_dollars: 10.00
+  max_trades_per_day: 1
   time_stop_minutes: 15
   chop_progress_threshold: 0.3
 
@@ -9,4 +10,19 @@ execution:
   trading_windows:
     - start: "10:00"
       end: "13:30"
+  morning_cutoff: "10:45"
+  midday_max_unit_pct: 0.0075  # 0.75% max (Entry - LOD) distance for afternoon setups
+
+universe:
+  mode: "curated"  # "curated" or "sp500"
+  curated_tickers:
+    - "ARM"
+    - "HOOD"
+    - "PLTR"
+    - "AMZN"
+    - "AAPL"
+    - "GOOGL"
+  require_daily_sma_pullback: true
+  sma_tolerance_pct: 0.03
+
 

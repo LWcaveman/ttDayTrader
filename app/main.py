@@ -22,7 +22,7 @@ async def main():
         print("CRITICAL: No production session available for Market Data. Exiting...")
         return
         
-    active_tickers = run_screener()
+    active_tickers = run_screener(config)
     if not active_tickers:
         print("No eligible tickers for today. Shutting down daemon.")
         return
