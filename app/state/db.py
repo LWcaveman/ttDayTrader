@@ -92,6 +92,16 @@ class StateManager:
             await db.commit()
             return cursor.lastrowid
 
+    async def update_stop_loss(self, ticker: str, new_stop_loss: float):
+        """Updates the stop loss price for an open position upon ratchet activation."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('''
+                UPDATE active_positions
+                SET stop_loss = ?
+                WHERE ticker = ? AND status = 'OPEN'
+            ''', (new_stop_loss, ticker))
+            await db.commit()
+
     async def close_position(self, ticker: str, exit_price: float, exit_time: str, exit_reason: str, realized_pnl: float, cost_basis: float, proceeds: float):
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute('''
