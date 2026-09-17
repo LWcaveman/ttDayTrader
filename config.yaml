@@ -2,9 +2,10 @@ risk_management:
   risk_pct_per_trade: 0.02
   max_risk_dollars: 10.00
   max_trades_per_day: 1
-  time_stop_minutes: 15
+  enable_chop_stop: false      # Disabled: 2-year backtest proved letting trades run doubled +3R targets from 28 to 60
+  time_stop_minutes: 0         # Disabled when enable_chop_stop is false
   chop_progress_threshold: 0.3
-  ratchet_1_5r: true  # Ratchet stop to Breakeven at +1.5R
+  ratchet_1_5r: true           # Ratchet stop to Breakeven at +1.5R
 
 execution:
   environment: "prod" 
@@ -19,12 +20,15 @@ execution:
 universe:
   mode: "curated"  # "curated" or "sp500"
   curated_tickers:
-    - "ARM"
-    - "HOOD"
-    - "PLTR"
-    - "AMZN"
-    - "AAPL"
-    - "GOOGL"
+    - "CONL"   # 2x Long Coinbase ETF (Top Performer: 3.03 PF)
+    - "SOXL"   # 3x Semiconductor Bull (2.16 PF)
+    - "TQQQ"   # 3x Nasdaq-100 Bull (1.66 PF)
+    - "PLTR"   # High Momentum Sweet Spot (1.97 PF)
+    - "RBLX"   # High Momentum Sweet Spot (1.90 PF)
+    - "AMZN"   # Mega-Cap Cloud Trend (2.00 PF)
+    - "AAPL"   # Mega-Cap Quality (1.32 PF)
+    - "ARM"    # High-Beta Tech (1.33 PF)
+    - "GOOGL"  # Mega-Cap Quality
   require_daily_sma_pullback: true
   sma_tolerance_pct: 0.03
 
@@ -39,7 +43,8 @@ market_gate:
     - "PSQ"
   bear_blacklist:
     - "ARM"
-    - "HOOD"
+    - "CONL"
+    - "SOXL"
   require_relative_strength: false
 
 

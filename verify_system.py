@@ -195,15 +195,21 @@ def test_config_file_integrity():
     min_close = cfg.get('execution', {}).get('min_close_pct')
     min_vol = cfg.get('execution', {}).get('min_vol_ratio')
 
+    enable_chop = cfg.get('risk_management', {}).get('enable_chop_stop')
     log_test("Config: max_trades_per_day == 1", max_trades == 1, f"Found {max_trades}")
     log_test("Config: ratchet_1_5r == True", ratchet is True, f"Found {ratchet}")
+    log_test("Config: enable_chop_stop == False (NO_CHOP_STOP Policy)", enable_chop is False, f"Found {enable_chop}")
     log_test("Config: min_close_pct == 0.60", min_close == 0.60, f"Found {min_close}")
     log_test("Config: min_vol_ratio == 0.80", min_vol == 0.80, f"Found {min_vol}")
+
+    curated = set(cfg.get('universe', {}).get('curated_tickers', []))
+    expected_curated = {'CONL', 'SOXL', 'TQQQ', 'PLTR', 'RBLX', 'AMZN', 'AAPL', 'ARM'}
+    log_test("Config: curated_tickers contains Elite Universe (CONL, SOXL, TQQQ, PLTR, etc.)", curated >= expected_curated, f"Found {curated}")
 
     gate_cfg = cfg.get('market_gate', {})
     log_test("Config: market_gate.enabled == True", gate_cfg.get('enabled') is True, "Market gate active")
     log_test("Config: market_gate.require_intraday_vwap_alignment == True", gate_cfg.get('require_intraday_vwap_alignment') is True, "Intraday VWAP gate active")
-    log_test("Config: market_gate.bear_blacklist contains ARM, HOOD", set(gate_cfg.get('bear_blacklist', [])) >= {'ARM', 'HOOD'}, f"Found {gate_cfg.get('bear_blacklist')}")
+    log_test("Config: market_gate.bear_blacklist contains ARM, CONL, SOXL", set(gate_cfg.get('bear_blacklist', [])) >= {'ARM', 'CONL', 'SOXL'}, f"Found {gate_cfg.get('bear_blacklist')}")
     log_test("Config: market_gate.inverse_tickers contains PSQ", 'PSQ' in gate_cfg.get('inverse_tickers', []), f"Found {gate_cfg.get('inverse_tickers')}")
 
 
