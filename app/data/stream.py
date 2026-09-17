@@ -22,7 +22,19 @@ def _bootstrap_single_tracker(ticker):
 async def start_market_stream(prod_session, cert_session, active_tickers, config, db):
     await hydrate_positions(db)
     
-    monitored_tickers = list(set(active_tickers + list(active_positions.keys())))
+    # Include Index Gate benchmarks (e.g. SPY, QQQ) so their intraday VWAP is tracked in real-time
+    gate_cfg = config.get("market_gate", {}) if config else {}
+    gate_enabled = gate_cfg.get("enabled", True)
+    idx_ticker = gate_cfg.get("index_ticker", "SPY")
+    reg_ticker = gate_cfg.get("regime_ticker", "QQQ")
+    
+    extra_tickers = []
+    if gate_enabled:
+        for sym in [idx_ticker, reg_ticker]:
+            if sym and sym not in active_tickers and sym not in active_positions:
+                extra_tickers.append(sym)
+
+    monitored_tickers = list(set(active_tickers + list(active_positions.keys()) + extra_tickers))
     
     print(f"Bootstrapping {len(monitored_tickers)} trackers using 20 concurrent threads (this should take ~15 seconds)...")
     trackers = {}
@@ -40,18 +52,18 @@ async def start_market_stream(prod_session, cert_session, active_tickers, config
             if tracker:
                 trackers[tracker.ticker] = tracker
 
-    active_tickers = list(trackers.keys())
-    if not active_tickers:
+    stream_symbols = list(trackers.keys())
+    if not stream_symbols:
         print("No tickers bootstrapped successfully. Exiting.")
         return
 
-    print(f"Successfully bootstrapped {len(active_tickers)} tickers.")
+    print(f"Successfully bootstrapped {len(stream_symbols)} tickers.")
     print("Connecting to DXLink WebSocket...")
     tz = pytz.timezone('America/New_York')
 
     async with DXLinkStreamer(prod_session) as streamer:
-        await streamer.subscribe(Trade, active_tickers)
-        print("Data stream active. Monitoring 1-minute aggregations for crossovers...")
+        await streamer.subscribe(Trade, stream_symbols)
+        print("Data stream active. Monitoring 1-minute aggregations for crossovers & Index Gate alignment...")
 
         async for trade_event in streamer.listen(Trade):
             ticker = trade_event.event_symbol
@@ -79,9 +91,33 @@ async def start_market_stream(prod_session, cert_session, active_tickers, config
 
             # 2. Entry Evaluation (Now passing prod_session)
             if is_within_trading_window(config) and len(active_positions) < 1:
+                # Benchmark indices are monitored for market tide only, not entered as trades
+                if gate_enabled and ticker in [idx_ticker, reg_ticker]:
+                    continue
+
                 min_close = float(config.get('execution', {}).get('min_close_pct', 0.60))
                 min_vol = float(config.get('execution', {}).get('min_vol_ratio', 0.80))
                 if tracker.check_crossover(current_price=price, min_close_pct=min_close, min_vol_ratio=min_vol):
+                    # Evaluate Intraday Market Gate Tide Alignment
+                    if gate_enabled and gate_cfg.get("require_intraday_vwap_alignment", True):
+                        inverse_tickers = gate_cfg.get("inverse_tickers", ["PSQ", "SH"])
+                        is_inverse = ticker in inverse_tickers
+
+                        if is_inverse:
+                            # Inverses require market declining intraday (QQQ below VWAP)
+                            reg_tracker = trackers.get(reg_ticker)
+                            if reg_tracker and reg_tracker.is_ready and reg_tracker.vwap > 0:
+                                if reg_tracker.current_close >= reg_tracker.vwap:
+                                    print(f"[INDEX GATE REJECT] {ticker} setup skipped: {reg_ticker} (${reg_tracker.current_close:.2f}) is ABOVE intraday VWAP (${reg_tracker.vwap:.2f}). Inverses require downward market tide.")
+                                    continue
+                        else:
+                            # Longs require market lifting intraday (SPY above VWAP)
+                            idx_tracker = trackers.get(idx_ticker)
+                            if idx_tracker and idx_tracker.is_ready and idx_tracker.vwap > 0:
+                                if idx_tracker.current_close < idx_tracker.vwap:
+                                    print(f"[INDEX GATE REJECT] {ticker} setup skipped: {idx_ticker} (${idx_tracker.current_close:.2f}) is BELOW intraday VWAP (${idx_tracker.vwap:.2f}). Longs require upward market tide.")
+                                    continue
+
                     print(f"[CROSS DETECTED] {ticker} | Price: {price:.2f} | VWAP: {tracker.vwap:.2f} | 9EMA: {tracker.ema_9:.2f}")
                     await evaluate_setup(
                         ticker=ticker,

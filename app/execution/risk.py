@@ -161,14 +161,17 @@ async def check_and_execute_exit(ticker, current_price, current_dt, prod_session
     elif current_price <= stop_loss:
         exit_reason = "BREAKEVEN" if abs(stop_loss - entry_price) < 0.02 else "STOP_LOSS"
     else:
-        elapsed_minutes = (current_dt - entry_time).total_seconds() / 60.0
-        time_stop_limit = config['risk_management'].get('time_stop_minutes', 15)
-        progress_factor = config['risk_management'].get('chop_progress_threshold', 0.3)
+        # Time / Chop Stop (disabled by default under NO_CHOP_STOP policy)
+        enable_chop_stop = config.get('risk_management', {}).get('enable_chop_stop', False)
+        if enable_chop_stop:
+            elapsed_minutes = (current_dt - entry_time).total_seconds() / 60.0
+            time_stop_limit = config['risk_management'].get('time_stop_minutes', 15)
+            progress_factor = config['risk_management'].get('chop_progress_threshold', 0.3)
 
-        if elapsed_minutes >= time_stop_limit:
-            progress_threshold = entry_price + ((target - entry_price) * progress_factor)
-            if current_price < progress_threshold:
-                exit_reason = "CHOP_TIME_STOP"
+            if time_stop_limit and time_stop_limit > 0 and elapsed_minutes >= time_stop_limit:
+                progress_threshold = entry_price + ((target - entry_price) * progress_factor)
+                if current_price < progress_threshold:
+                    exit_reason = "CHOP_TIME_STOP"
 
     if not exit_reason and current_dt.time() >= time(15, 58):
         exit_reason = "EOD_EXIT"
