@@ -30,9 +30,34 @@ class StateManager:
                     exit_price REAL,
                     exit_time TEXT,
                     exit_reason TEXT,
-                    realized_pnl REAL
+                    realized_pnl REAL,
+                    orig_shares REAL,
+                    unit REAL,
+                    scaled INTEGER DEFAULT 0,
+                    scaled_shares REAL DEFAULT 0.0,
+                    scaled_price REAL DEFAULT 0.0,
+                    scaled_pnl REAL DEFAULT 0.0
                 )
             ''')
+            # Ensure partial scaling columns exist if migrating an existing database
+            async with db.execute('PRAGMA table_info(active_positions)') as cursor:
+                columns = [row[1] for row in await cursor.fetchall()]
+
+            if 'orig_shares' not in columns:
+                await db.execute('ALTER TABLE active_positions ADD COLUMN orig_shares REAL')
+            if 'unit' not in columns:
+                await db.execute('ALTER TABLE active_positions ADD COLUMN unit REAL')
+            if 'scaled' not in columns:
+                await db.execute('ALTER TABLE active_positions ADD COLUMN scaled INTEGER DEFAULT 0')
+            if 'scaled_shares' not in columns:
+                await db.execute('ALTER TABLE active_positions ADD COLUMN scaled_shares REAL DEFAULT 0.0')
+            if 'scaled_price' not in columns:
+                await db.execute('ALTER TABLE active_positions ADD COLUMN scaled_price REAL DEFAULT 0.0')
+            if 'scaled_pnl' not in columns:
+                await db.execute('ALTER TABLE active_positions ADD COLUMN scaled_pnl REAL DEFAULT 0.0')
+
+            await db.execute('UPDATE active_positions SET orig_shares = shares WHERE orig_shares IS NULL')
+
             async with db.execute('SELECT count(*) FROM portfolio') as cursor:
                 row = await cursor.fetchone()
                 if row[0] == 0:
@@ -83,14 +108,33 @@ class StateManager:
             ''', (amount, amount))
             await db.commit()
 
-    async def open_position(self, ticker: str, shares: float, entry_price: float, stop_loss: float, target: float, entry_time: str):
+    async def open_position(self, ticker: str, shares: float, entry_price: float, stop_loss: float, target: float, entry_time: str, orig_shares: float = None, unit: float = None):
+        if orig_shares is None:
+            orig_shares = shares
+        if unit is None:
+            unit = target - entry_price
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute('''
-                INSERT INTO active_positions (ticker, shares, entry_price, stop_loss, target, entry_time, status)
-                VALUES (?, ?, ?, ?, ?, ?, 'OPEN')
-            ''', (ticker, shares, entry_price, stop_loss, target, entry_time))
+                INSERT INTO active_positions (ticker, shares, entry_price, stop_loss, target, entry_time, status, orig_shares, unit, scaled, scaled_shares, scaled_price, scaled_pnl)
+                VALUES (?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, 0, 0.0, 0.0, 0.0)
+            ''', (ticker, shares, entry_price, stop_loss, target, entry_time, orig_shares, unit))
             await db.commit()
             return cursor.lastrowid
+
+    async def record_partial_exit(self, ticker: str, scaled_shares: float, remaining_shares: float, scaled_price: float, scaled_pnl: float, new_stop_loss: float):
+        """Records partial scale-out execution in SQLite and updates stop loss to breakeven."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('''
+                UPDATE active_positions
+                SET shares = ?,
+                    stop_loss = ?,
+                    scaled = 1,
+                    scaled_shares = ?,
+                    scaled_price = ?,
+                    scaled_pnl = ?
+                WHERE ticker = ? AND status = 'OPEN'
+            ''', (remaining_shares, new_stop_loss, scaled_shares, scaled_price, scaled_pnl, ticker))
+            await db.commit()
 
     async def update_stop_loss(self, ticker: str, new_stop_loss: float):
         """Updates the stop loss price for an open position upon ratchet activation."""
@@ -126,7 +170,8 @@ class StateManager:
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute('''
-                SELECT id, ticker, shares, entry_price, stop_loss, target, entry_time, status
+                SELECT id, ticker, shares, entry_price, stop_loss, target, entry_time, status,
+                       orig_shares, unit, scaled, scaled_shares, scaled_price, scaled_pnl
                 FROM active_positions
                 WHERE status = 'OPEN'
             ''') as cursor:

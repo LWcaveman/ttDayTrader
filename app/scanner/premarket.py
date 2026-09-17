@@ -5,9 +5,9 @@ import pytz
 import urllib.request
 import io
 
-# Elite Curated Day-Trading Universe (Optimized for 9 EMA / VWAP 3R Setup)
+# Elite Curated Day-Trading Universe (Optimized for Pure Cash Account & High Beta 2x Momentum)
 DEFAULT_CURATED_TICKERS = [
-    "ARM", "HOOD", "PLTR", "AMZN", "AAPL", "GOOGL"
+    "TSLL", "NVDL", "CONL", "TQQQ", "PLTR", "RBLX", "AAPL", "AMZN"
 ]
 
 def get_curated_tickers(config=None):
@@ -117,7 +117,7 @@ def run_screener(config=None):
         reg_sym = gate_cfg.get("regime_ticker", "QQQ")
         print(f"\n[MARKET REGIME] Benchmark: {reg_sym} | Yesterday Close: ${qqq_close:.2f} | 50 EMA: ${qqq_ema:.2f} -> REGIME: {regime}")
         
-        bear_blacklist = gate_cfg.get("bear_blacklist", ["ARM", "HOOD"])
+        bear_blacklist = gate_cfg.get("bear_blacklist", ["TSLL", "NVDL", "CONL"])
         inverse_tickers = gate_cfg.get("inverse_tickers", ["PSQ"])
         enable_inverses = gate_cfg.get("enable_inverses_in_bear", True)
 
