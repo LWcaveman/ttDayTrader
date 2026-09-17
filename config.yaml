@@ -28,4 +28,19 @@ universe:
   require_daily_sma_pullback: true
   sma_tolerance_pct: 0.03
 
+market_gate:
+  enabled: true
+  index_ticker: "SPY"
+  regime_ticker: "QQQ"
+  daily_ema_period: 50
+  require_intraday_vwap_alignment: true
+  enable_inverses_in_bear: true
+  inverse_tickers:
+    - "PSQ"
+  bear_blacklist:
+    - "ARM"
+    - "HOOD"
+  require_relative_strength: false
+
+
 

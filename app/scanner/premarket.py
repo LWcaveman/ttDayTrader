@@ -50,11 +50,50 @@ def get_sp500_tickers():
 
     return DEFAULT_CURATED_TICKERS
 
+def get_market_regime(config=None):
+    """
+    Evaluates market regime using the daily 50 EMA on the benchmark (default: QQQ).
+    Returns tuple: (regime, last_close, ema_50).
+    Uses yesterday's completed daily close to eliminate lookahead bias.
+    """
+    gate_cfg = config.get("market_gate", {}) if config else {}
+    if not gate_cfg.get("enabled", True):
+        return "BULL", 0.0, 0.0
+
+    regime_ticker = gate_cfg.get("regime_ticker", "QQQ")
+    ema_period = int(gate_cfg.get("daily_ema_period", 50))
+
+    try:
+        df = yf.download(regime_ticker, period="6mo", interval="1d", progress=False)
+        if df.empty:
+            print(f"Warning: Could not fetch daily data for {regime_ticker}. Defaulting to BULL.")
+            return "BULL", 0.0, 0.0
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        df["EMA"] = df["Close"].ewm(span=ema_period, adjust=False).mean()
+
+        today = datetime.now(pytz.timezone('America/New_York')).date()
+        completed = df[pd.to_datetime(df.index).date < today] if today in pd.to_datetime(df.index).date else df
+        if completed.empty:
+            completed = df
+
+        last_close = float(completed["Close"].iloc[-1])
+        ema_val = float(completed["EMA"].iloc[-1])
+        regime = "BULL" if last_close > ema_val else "BEAR"
+        return regime, last_close, ema_val
+    except Exception as e:
+        print(f"Warning: Error calculating market regime ({e}). Defaulting to BULL.")
+        return "BULL", 0.0, 0.0
+
+
 def run_screener(config=None):
     """
     Scans candidate tickers to verify they closed yesterday within the 
     specified tolerance (default: 3%) of their 5 SMA or 10 SMA.
-    Defaults to the curated elite universe (ARM, HOOD, PLTR, AMZN, AAPL, GOOGL).
+    Enforces Market Regime filtering (blocking high-beta longs in bear markets,
+    activating inverse hedges like PSQ).
     """
     mode = "curated"
     tolerance = 0.03
@@ -71,7 +110,30 @@ def run_screener(config=None):
     else:
         universe = get_curated_tickers(config)
 
-    print(f"Running pre-market screener for {len(universe)} curated tickers: {', '.join(universe)}")
+    # 1. Market Gate Regime Evaluation
+    gate_cfg = config.get("market_gate", {}) if config else {}
+    if gate_cfg.get("enabled", True):
+        regime, qqq_close, qqq_ema = get_market_regime(config)
+        reg_sym = gate_cfg.get("regime_ticker", "QQQ")
+        print(f"\n[MARKET REGIME] Benchmark: {reg_sym} | Yesterday Close: ${qqq_close:.2f} | 50 EMA: ${qqq_ema:.2f} -> REGIME: {regime}")
+        
+        bear_blacklist = gate_cfg.get("bear_blacklist", ["ARM", "HOOD"])
+        inverse_tickers = gate_cfg.get("inverse_tickers", ["PSQ"])
+        enable_inverses = gate_cfg.get("enable_inverses_in_bear", True)
+
+        if regime == "BEAR":
+            universe = [t for t in universe if t not in bear_blacklist]
+            print(f"  [REGIME FILTER] Bear regime active. Blacklisted volatile mid-caps: {bear_blacklist}")
+            if enable_inverses:
+                for inv in inverse_tickers:
+                    if inv not in universe:
+                        universe.append(inv)
+                print(f"  [REGIME FILTER] Unlocked inverse hedge tickers: {inverse_tickers}")
+        else:
+            universe = [t for t in universe if t not in inverse_tickers]
+            print(f"  [REGIME FILTER] Bull regime active. Inverse tickers suppressed: {inverse_tickers}")
+
+    print(f"Running pre-market screener for {len(universe)} candidate tickers: {', '.join(universe)}")
 
     if not require_pullback:
         print(f"Daily SMA pre-filtering disabled. Monitoring all {len(universe)} tickers.")
@@ -114,7 +176,7 @@ def run_screener(config=None):
 
     if not valid_tickers:
         print(f"Notice: No tickers met the {tolerance*100:.0f}% pre-market SMA pullback filter.")
-        print("Falling back to monitoring all curated tickers so intraday crosses can dynamically evaluate SMA pullback at execution.")
+        print("Falling back to monitoring all candidate tickers so intraday crosses can dynamically evaluate SMA pullback at execution.")
         return universe
 
     print(f"Screener finished: {len(valid_tickers)}/{len(universe)} tickers eligible for intraday execution today.")

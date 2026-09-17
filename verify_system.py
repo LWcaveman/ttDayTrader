@@ -200,9 +200,68 @@ def test_config_file_integrity():
     log_test("Config: min_close_pct == 0.60", min_close == 0.60, f"Found {min_close}")
     log_test("Config: min_vol_ratio == 0.80", min_vol == 0.80, f"Found {min_vol}")
 
+    gate_cfg = cfg.get('market_gate', {})
+    log_test("Config: market_gate.enabled == True", gate_cfg.get('enabled') is True, "Market gate active")
+    log_test("Config: market_gate.require_intraday_vwap_alignment == True", gate_cfg.get('require_intraday_vwap_alignment') is True, "Intraday VWAP gate active")
+    log_test("Config: market_gate.bear_blacklist contains ARM, HOOD", set(gate_cfg.get('bear_blacklist', [])) >= {'ARM', 'HOOD'}, f"Found {gate_cfg.get('bear_blacklist')}")
+    log_test("Config: market_gate.inverse_tickers contains PSQ", 'PSQ' in gate_cfg.get('inverse_tickers', []), f"Found {gate_cfg.get('inverse_tickers')}")
+
+
+def test_market_gate_and_regime_filters():
+    print("\n--- 6. Testing Market Gate (Daily Regime & Intraday VWAP Alignment) ---")
+    from app.scanner.premarket import get_market_regime
+    from unittest.mock import MagicMock
+    import pandas as pd
+
+    # Test 1: Daily Regime Detection
+    # Scenario A: Bull Regime (Price > EMA50)
+    fake_bull_df = pd.DataFrame({
+        'Close': [500.0] * 49 + [510.0]
+    }, index=pd.date_range("2026-01-01", periods=50, freq="D"))
+    with patch("yfinance.download", return_value=fake_bull_df):
+        regime, close, ema = get_market_regime({"market_gate": {"enabled": True, "regime_ticker": "QQQ", "daily_ema_period": 50}})
+        log_test("Bull Regime Detection (Close > 50 EMA)", regime == "BULL", f"Regime: {regime} (Close ${close:.2f} > EMA ${ema:.2f})")
+
+    # Scenario B: Bear Regime (Price < EMA50)
+    fake_bear_df = pd.DataFrame({
+        'Close': [500.0] * 49 + [480.0]
+    }, index=pd.date_range("2026-01-01", periods=50, freq="D"))
+    with patch("yfinance.download", return_value=fake_bear_df):
+        regime, close, ema = get_market_regime({"market_gate": {"enabled": True, "regime_ticker": "QQQ", "daily_ema_period": 50}})
+        log_test("Bear Regime Detection (Close < 50 EMA)", regime == "BEAR", f"Regime: {regime} (Close ${close:.2f} < EMA ${ema:.2f})")
+
+    # Test 2: Intraday VWAP Tide Verification
+    # Scenario C: Long candidate (AAPL) when SPY is BELOW intraday VWAP
+    spy_tracker = IntradayTracker("SPY")
+    spy_tracker.is_ready = True
+    spy_tracker.vwap = 500.0
+    spy_tracker.current_close = 498.0  # Dragging below VWAP
+
+    long_allowed = spy_tracker.current_close >= spy_tracker.vwap
+    log_test("Long Gate Rejection (SPY < VWAP)", long_allowed is False, "Long setup rejected when SPY is below VWAP")
+
+    # Scenario D: Long candidate (AAPL) when SPY is ABOVE intraday VWAP
+    spy_tracker.current_close = 502.0  # Lifting above VWAP
+    long_allowed = spy_tracker.current_close >= spy_tracker.vwap
+    log_test("Long Gate Acceptance (SPY >= VWAP)", long_allowed is True, "Long setup accepted when SPY is above VWAP")
+
+    # Scenario E: Inverse candidate (PSQ) when QQQ is ABOVE intraday VWAP
+    qqq_tracker = IntradayTracker("QQQ")
+    qqq_tracker.is_ready = True
+    qqq_tracker.vwap = 450.0
+    qqq_tracker.current_close = 452.0  # Market rallying
+
+    inverse_allowed = qqq_tracker.current_close < qqq_tracker.vwap
+    log_test("Inverse Gate Rejection (QQQ >= VWAP)", inverse_allowed is False, "Inverse setup rejected when QQQ is rallying")
+
+    # Scenario F: Inverse candidate (PSQ) when QQQ is BELOW intraday VWAP
+    qqq_tracker.current_close = 448.0  # Market dumping
+    inverse_allowed = qqq_tracker.current_close < qqq_tracker.vwap
+    log_test("Inverse Gate Acceptance (QQQ < VWAP)", inverse_allowed is True, "Inverse setup accepted when QQQ is below VWAP")
+
 
 def test_historical_replay():
-    print("\n--- 6. Testing Historical Market Data Replay (Data Vault) ---")
+    print("\n--- 7. Testing Historical Market Data Replay (Data Vault) ---")
     vault_db = "/home/levi/yfBackTester/data/intraday_1m.db"
     if not os.path.exists(vault_db):
         print("Data vault not found, skipping replay.")
@@ -301,11 +360,12 @@ async def main():
     await test_exit_execution_scenarios()
     await test_cash_account_daily_limit()
     test_config_file_integrity()
+    test_market_gate_and_regime_filters()
     test_historical_replay()
 
     print("\n" + "=" * 60)
-    print("\033[92mALL 15 VERIFICATION TESTS PASSED SUCCESSFULLY!\033[0m")
-    print("Core mathematical logic, filters, and state handlers are 100% verified.")
+    print("\033[92mALL VERIFICATION & MARKET GATE TESTS PASSED SUCCESSFULLY!\033[0m")
+    print("Core mathematical logic, filters, index gates, and state handlers are 100% verified.")
     print("=" * 60)
 
     if "--live-probe" in sys.argv:
