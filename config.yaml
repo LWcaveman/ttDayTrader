@@ -11,7 +11,7 @@ execution:
   environment: "prod" 
   trading_windows:
     - start: "10:00"
-      end: "13:30"
+      end: "10:45"
   morning_cutoff: "10:45"
   midday_max_unit_pct: 0.0075  # 0.75% max (Entry - LOD) distance for afternoon setups
   min_close_pct: 0.60          # Bullish close filter: upper 40% of 1m candle
