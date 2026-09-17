@@ -1,11 +1,15 @@
 risk_management:
   risk_pct_per_trade: 0.02
-  max_risk_dollars: 10.00
-  max_trades_per_day: 1
+  max_risk_dollars: 20.00
+  max_trades_per_day: 2        # Route 1: Allows up to 2 morning trades per day for Pure Cash Account
   enable_chop_stop: false      # Disabled: 2-year backtest proved letting trades run doubled +3R targets from 28 to 60
   time_stop_minutes: 0         # Disabled when enable_chop_stop is false
   chop_progress_threshold: 0.3
   ratchet_1_5r: true           # Ratchet stop to Breakeven at +1.5R
+  enable_partial_scale: true   # Route 1: Scale out 33% at +1.5R, ratchet stop to Breakeven, runner to +4.0R
+  partial_scale_r: 1.5         # +1.5R partial profit target
+  partial_scale_pct: 0.33      # Scale 33% of position
+  runner_r: 4.0                # +4.0R runner target for remaining 67%
 
 execution:
   environment: "prod" 
@@ -20,15 +24,14 @@ execution:
 universe:
   mode: "curated"  # "curated" or "sp500"
   curated_tickers:
+    - "TSLL"   # 2x Long Tesla ETF (Elite High Beta)
+    - "NVDL"   # 2x Long NVDA ETF (Elite High Beta)
     - "CONL"   # 2x Long Coinbase ETF (Top Performer: 3.03 PF)
-    - "SOXL"   # 3x Semiconductor Bull (2.16 PF)
-    - "TQQQ"   # 3x Nasdaq-100 Bull (1.66 PF)
+    - "TQQQ"   # 3x Nasdaq-100 Bull ETF (1.66 PF)
     - "PLTR"   # High Momentum Sweet Spot (1.97 PF)
     - "RBLX"   # High Momentum Sweet Spot (1.90 PF)
-    - "AMZN"   # Mega-Cap Cloud Trend (2.00 PF)
     - "AAPL"   # Mega-Cap Quality (1.32 PF)
-    - "ARM"    # High-Beta Tech (1.33 PF)
-    - "GOOGL"  # Mega-Cap Quality
+    - "AMZN"   # Mega-Cap Cloud Trend (2.00 PF)
   require_daily_sma_pullback: true
   sma_tolerance_pct: 0.03
 
@@ -42,9 +45,9 @@ market_gate:
   inverse_tickers:
     - "PSQ"
   bear_blacklist:
-    - "ARM"
+    - "TSLL"
+    - "NVDL"
     - "CONL"
-    - "SOXL"
   require_relative_strength: false
 
 

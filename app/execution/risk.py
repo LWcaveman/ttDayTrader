@@ -17,13 +17,21 @@ async def hydrate_positions(db):
         entry_dt = datetime.fromisoformat(trade['entry_time'])
         if entry_dt.tzinfo is None:
             entry_dt = tz.localize(entry_dt)
+        shares = float(trade['shares'])
+        orig_shares = float(trade['orig_shares']) if trade.get('orig_shares') is not None else shares
+        unit = float(trade['unit']) if trade.get('unit') is not None else float(trade['target'] - trade['entry_price'])
         active_positions[ticker] = {
-            'shares': trade['shares'],
-            'entry_price': trade['entry_price'],
-            'stop_loss': trade['stop_loss'],
-            'target': trade['target'],
-            'unit': trade['target'] - trade['entry_price'],
-            'entry_time': entry_dt
+            'shares': shares,
+            'orig_shares': orig_shares,
+            'entry_price': float(trade['entry_price']),
+            'stop_loss': float(trade['stop_loss']),
+            'target': float(trade['target']),
+            'unit': unit,
+            'entry_time': entry_dt,
+            'scaled': bool(trade.get('scaled', False)),
+            'scaled_shares': float(trade.get('scaled_shares', 0.0) or 0.0),
+            'scaled_price': float(trade.get('scaled_price', 0.0) or 0.0),
+            'scaled_pnl': float(trade.get('scaled_pnl', 0.0) or 0.0)
         }
     if open_trades:
         print(f"[RECOVERY] Hydrated {len(open_trades)} active positions from SQLite.")
@@ -76,7 +84,13 @@ async def evaluate_setup(ticker, tracker, current_price, prod_session, config, d
             rejected_cooldowns.add(ticker)
             return
 
-    target = current_price + unit
+    enable_partial = config.get('risk_management', {}).get('enable_partial_scale', True)
+    runner_r = float(config.get('risk_management', {}).get('runner_r', 4.0))
+
+    if enable_partial:
+        target = current_price + (unit / 3.0) * runner_r
+    else:
+        target = current_price + unit
     stop_loss = current_price - (unit / 3.0)
 
     risk_pct = config['risk_management']['risk_pct_per_trade']
@@ -97,7 +111,8 @@ async def evaluate_setup(ticker, tracker, current_price, prod_session, config, d
         if cost_basis <= 0:
             return
 
-    print(f"[{ticker}] Setup Detected: Entry ${current_price:.2f} | Target ${target:.2f} | Stop ${stop_loss:.2f}")
+    target_label = f"{runner_r:.1f}R" if enable_partial else "3.0R"
+    print(f"[{ticker}] Setup Detected: Entry ${current_price:.2f} | Target ({target_label}) ${target:.2f} | Stop (-1.0R) ${stop_loss:.2f}")
     print(f"[{ticker}] Executing {shares} shares via ROBINHOOD (${cost_basis:.2f})...")
 
     tz = pytz.timezone('America/New_York')
@@ -113,16 +128,23 @@ async def evaluate_setup(ticker, tracker, current_price, prod_session, config, d
             entry_price=current_price,
             stop_loss=stop_loss,
             target=target,
-            entry_time=now_dt.isoformat()
+            entry_time=now_dt.isoformat(),
+            orig_shares=shares,
+            unit=unit
         )
 
         active_positions[ticker] = {
             'shares': shares,
+            'orig_shares': shares,
             'entry_price': current_price,
             'stop_loss': stop_loss,
             'target': target,
             'unit': unit,
-            'entry_time': now_dt
+            'entry_time': now_dt,
+            'scaled': False,
+            'scaled_shares': 0.0,
+            'scaled_price': 0.0,
+            'scaled_pnl': 0.0
         }
         print(f"[{ticker}] Robinhood Buy Order Routed Successfully. Position active.")
     except Exception as e:
@@ -141,10 +163,73 @@ async def check_and_execute_exit(ticker, current_price, current_dt, prod_session
     shares = position['shares']
     unit = position.get('unit', target - entry_price)
 
-    # 1. Check +1.5R Breakeven Ratchet (Protects small account gains)
-    ratchet_enabled = config.get('risk_management', {}).get('ratchet_1_5r', True)
-    if ratchet_enabled and stop_loss < entry_price:
-        halfway_target = entry_price + (unit * 0.5)  # halfway to 3R = +1.5R
+    rm_cfg = config.get('risk_management', {})
+    enable_partial = rm_cfg.get('enable_partial_scale', True)
+    partial_r = float(rm_cfg.get('partial_scale_r', 1.5))
+    partial_pct = float(rm_cfg.get('partial_scale_pct', 0.33))
+    runner_r = float(rm_cfg.get('runner_r', 4.0))
+    ratchet_enabled = rm_cfg.get('ratchet_1_5r', True)
+
+    # 1. Check Partial Scaling or Breakeven Ratchet
+    # 1R distance is unit / 3.0
+    r_unit = unit / 3.0 if unit > 0 else (target - entry_price) / runner_r
+    halfway_target = entry_price + (r_unit * partial_r)  # +1.5R target
+
+    if enable_partial and not position.get('scaled', False):
+        if current_price >= halfway_target:
+            orig_shares = position.get('orig_shares', shares)
+            scale_shares = round(orig_shares * partial_pct, 4)
+            remaining_shares = round(shares - scale_shares, 4)
+
+            # Defensive validation: ensure fractional sizes are valid
+            if scale_shares > 0 and remaining_shares > 0:
+                print(f"[{ticker}] PARTIAL SCALE TRIGGERED: Price ${current_price:.2f} reached +{partial_r}R (${halfway_target:.2f}). Selling {scale_shares} shares ({partial_pct*100:.0f}%)...")
+                try:
+                    await route_rh_market_order(ticker, scale_shares, action="SELL")
+                    scale_cost = round(scale_shares * entry_price, 2)
+                    scale_proceeds = round(scale_shares * current_price, 2)
+                    scale_pnl = round(scale_proceeds - scale_cost, 2)
+
+                    position['shares'] = remaining_shares
+                    position['stop_loss'] = entry_price
+                    position['scaled'] = True
+                    position['scaled_shares'] = scale_shares
+                    position['scaled_price'] = current_price
+                    position['scaled_pnl'] = scale_pnl
+                    stop_loss = entry_price
+
+                    print(f"[{ticker}] PARTIAL SCALE EXECUTED: Sold {scale_shares} shares at ${current_price:.2f} | Scaled PnL: ${scale_pnl:+.2f}. Holding {remaining_shares} runner shares to {runner_r}R. Stop moved to Breakeven (${entry_price:.2f}).")
+                    try:
+                        await db.record_partial_exit(
+                            ticker=ticker,
+                            scaled_shares=scale_shares,
+                            remaining_shares=remaining_shares,
+                            scaled_price=current_price,
+                            scaled_pnl=scale_pnl,
+                            new_stop_loss=entry_price
+                        )
+                    except Exception as e:
+                        print(f"[{ticker}] Warning: Failed to persist partial exit to DB: {e}")
+                except Exception as e:
+                    print(f"[{ticker}] CRITICAL: Partial scale sell order failed: {e}. Moving stop to breakeven defensively.")
+                    position['stop_loss'] = entry_price
+                    stop_loss = entry_price
+                    try:
+                        await db.update_stop_loss(ticker, entry_price)
+                    except Exception as ex:
+                        print(f"[{ticker}] Warning: Failed to update stop to DB: {ex}")
+            else:
+                # Share size too small to divide; ratchet stop to breakeven
+                position['stop_loss'] = entry_price
+                stop_loss = entry_price
+                position['scaled'] = True
+                print(f"[{ticker}] RATCHET ACTIVATED (Position too small to split): Stop moved to Breakeven (${entry_price:.2f}).")
+                try:
+                    await db.update_stop_loss(ticker, entry_price)
+                except Exception as e:
+                    print(f"[{ticker}] Warning: Failed to persist ratcheted stop to DB: {e}")
+
+    elif ratchet_enabled and stop_loss < entry_price:
         if current_price >= halfway_target:
             position['stop_loss'] = entry_price
             stop_loss = entry_price
@@ -157,16 +242,22 @@ async def check_and_execute_exit(ticker, current_price, current_dt, prod_session
     exit_reason = None
 
     if current_price >= target:
-        exit_reason = "TARGET_3R"
+        if position.get('scaled', False):
+            exit_reason = f"PARTIAL_AND_RUNNER_{runner_r:.1f}R"
+        else:
+            exit_reason = f"TARGET_{runner_r:.1f}R" if enable_partial else "TARGET_3R"
     elif current_price <= stop_loss:
-        exit_reason = "BREAKEVEN" if abs(stop_loss - entry_price) < 0.02 else "STOP_LOSS"
+        if position.get('scaled', False):
+            exit_reason = f"PARTIAL_{partial_r:.1f}R_AND_BE"
+        else:
+            exit_reason = "BREAKEVEN" if abs(stop_loss - entry_price) < 0.02 else "STOP_LOSS"
     else:
         # Time / Chop Stop (disabled by default under NO_CHOP_STOP policy)
-        enable_chop_stop = config.get('risk_management', {}).get('enable_chop_stop', False)
+        enable_chop_stop = rm_cfg.get('enable_chop_stop', False)
         if enable_chop_stop:
             elapsed_minutes = (current_dt - entry_time).total_seconds() / 60.0
-            time_stop_limit = config['risk_management'].get('time_stop_minutes', 15)
-            progress_factor = config['risk_management'].get('chop_progress_threshold', 0.3)
+            time_stop_limit = rm_cfg.get('time_stop_minutes', 15)
+            progress_factor = rm_cfg.get('chop_progress_threshold', 0.3)
 
             if time_stop_limit and time_stop_limit > 0 and elapsed_minutes >= time_stop_limit:
                 progress_threshold = entry_price + ((target - entry_price) * progress_factor)
@@ -182,23 +273,31 @@ async def check_and_execute_exit(ticker, current_price, current_dt, prod_session
     del active_positions[ticker]
     print(f"[{ticker}] Exit Triggered: {exit_reason} at ${current_price:.2f}")
 
-    cost_basis = round(shares * entry_price, 2)
-    proceeds = round(shares * current_price, 2)
-    realized_pnl = round(proceeds - cost_basis, 2)
+    current_shares = position['shares']
+    remaining_cost = round(current_shares * entry_price, 2)
+    remaining_proceeds = round(current_shares * current_price, 2)
+    remaining_pnl = round(remaining_proceeds - remaining_cost, 2)
+
+    scaled_pnl = float(position.get('scaled_pnl', 0.0) or 0.0)
+    total_realized_pnl = round(scaled_pnl + remaining_pnl, 2)
+
+    orig_shares = float(position.get('orig_shares', current_shares) or current_shares)
+    total_cost_basis = round(orig_shares * entry_price, 2)
+    total_proceeds = round(total_cost_basis + total_realized_pnl, 2)
 
     try:
         # EXECUTE SELL VIA ROBINHOOD
-        await route_rh_market_order(ticker, shares, action="SELL")
+        await route_rh_market_order(ticker, current_shares, action="SELL")
         await db.close_position(
             ticker=ticker,
             exit_price=current_price,
             exit_time=current_dt.isoformat(),
             exit_reason=exit_reason,
-            realized_pnl=realized_pnl,
-            cost_basis=cost_basis,
-            proceeds=proceeds
+            realized_pnl=total_realized_pnl,
+            cost_basis=total_cost_basis,
+            proceeds=total_proceeds
         )
-        print(f"[{ticker}] Closed {shares} shares | PnL: ${realized_pnl:+.2f} ({exit_reason})")
+        print(f"[{ticker}] Closed remaining {current_shares} shares | Trade Realized PnL: ${total_realized_pnl:+.2f} ({exit_reason})")
     except Exception as e:
         print(f"[{ticker}] CRITICAL: Failed to route SELL order via Robinhood: {e}")
         active_positions[ticker] = position

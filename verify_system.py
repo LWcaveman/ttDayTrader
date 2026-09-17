@@ -74,87 +74,140 @@ def test_indicator_edge_filters():
 
 
 async def test_database_and_ratchet():
-    print("\n--- 2. Testing SQLite State & +1.5R Breakeven Ratchet ---")
+    print("\n--- 2. Testing SQLite State & Partial Scaling Persistence ---")
     with tempfile.TemporaryDirectory() as tmpdir:
         test_db_path = os.path.join(tmpdir, "test_state.db")
         db = StateManager(db_path=test_db_path)
         await db.initialize_db()
         log_test("SQLite Schema Initialization", os.path.exists(test_db_path), f"Created {test_db_path}")
 
-        # Test insert position
+        # Test insert position with runner target
         now_iso = datetime.now(pytz.timezone('America/New_York')).isoformat()
         row_id = await db.open_position(
             ticker="PLTR",
             shares=10.0,
             entry_price=100.0,
             stop_loss=99.0,
-            target=103.0,
-            entry_time=now_iso
+            target=104.0,
+            entry_time=now_iso,
+            orig_shares=10.0,
+            unit=3.0
         )
         log_test("Open Position in DB", row_id is not None and row_id > 0, "Position logged")
 
-        # Test updating stop loss via ratchet
-        await db.update_stop_loss(ticker="PLTR", new_stop_loss=100.0)
+        # Test recording partial exit at +1.5R in DB
+        await db.record_partial_exit(
+            ticker="PLTR",
+            scaled_shares=3.3,
+            remaining_shares=6.7,
+            scaled_price=101.50,
+            scaled_pnl=4.95,
+            new_stop_loss=100.0
+        )
         open_positions = await db.get_open_positions()
         pos = open_positions[0]
-        log_test("Ratchet DB Update", pos['stop_loss'] == 100.0, f"Stop updated to ${pos['stop_loss']:.2f}")
+        log_test("Partial Scale DB Update", pos['shares'] == 6.7 and pos['stop_loss'] == 100.0 and pos['scaled'] == 1, f"Remaining: {pos['shares']} shs | Stop: ${pos['stop_loss']:.2f} | Scaled: {pos['scaled']}")
 
         # Test hydrate positions
         risk_module.active_positions.clear()
         await risk_module.hydrate_positions(db)
-        log_test("Hydrate Ratcheted Position", "PLTR" in risk_module.active_positions and risk_module.active_positions["PLTR"]['stop_loss'] == 100.0, "Active position restored with unit and breakeven stop")
+        hydrated = risk_module.active_positions.get("PLTR")
+        log_test(
+            "Hydrate Partial Scaled Position",
+            hydrated is not None and hydrated['shares'] == 6.7 and hydrated['stop_loss'] == 100.0 and hydrated['scaled'] is True,
+            f"Active position restored: {hydrated['shares']} shares, breakeven stop, scaled={hydrated['scaled']}"
+        )
 
 
 async def test_exit_execution_scenarios():
-    print("\n--- 3. Testing Exit Logic & Breakeven Protection ---")
+    print("\n--- 3. Testing Exit Logic, Partial Scaling & Runner Execution ---")
     tz = pytz.timezone('America/New_York')
-    now_dt = datetime.now(tz)
+    now_dt = datetime.now(tz).replace(hour=10, minute=15, second=0, microsecond=0)
     config = {
         'risk_management': {
             'ratchet_1_5r': True,
+            'enable_partial_scale': True,
+            'partial_scale_r': 1.5,
+            'partial_scale_pct': 0.33,
+            'runner_r': 4.0,
             'time_stop_minutes': 15,
             'chop_progress_threshold': 0.3
         }
     }
 
-    # Setup a mock position: Entry: 100, Stop: 99 (-1R), Target: 103 (+3R). Halfway (+1.5R) = 101.50
+    # Setup a mock position: Entry: 100, Stop: 99 (-1R), Target: 104 (+4R runner). Halfway (+1.5R) = 101.50
     risk_module.active_positions["HOOD"] = {
         'shares': 10.0,
+        'orig_shares': 10.0,
         'entry_price': 100.0,
         'stop_loss': 99.0,
-        'target': 103.0,
+        'target': 104.0,
         'unit': 3.0,
-        'entry_time': now_dt
+        'entry_time': now_dt,
+        'scaled': False,
+        'scaled_shares': 0.0,
+        'scaled_price': 0.0,
+        'scaled_pnl': 0.0
     }
 
     mock_db = AsyncMock()
 
-    # Step A: Price moves to 101.00 (below +1.5R). Ratchet should NOT trigger.
+    # Step A: Price moves to 101.00 (below +1.5R). Neither partial scale nor ratchet should trigger.
     await risk_module.check_and_execute_exit("HOOD", 101.00, now_dt, None, config, mock_db)
-    log_test("Price < +1.5R (No Ratchet)", risk_module.active_positions["HOOD"]['stop_loss'] == 99.0, "Stop remains at $99.00")
+    log_test("Price < +1.5R (No Action)", risk_module.active_positions["HOOD"]['stop_loss'] == 99.0 and not risk_module.active_positions["HOOD"]['scaled'], "Stop remains at $99.00, scaled=False")
 
-    # Step B: Price moves to 101.55 (>= +1.5R). Ratchet MUST trigger.
-    await risk_module.check_and_execute_exit("HOOD", 101.55, now_dt, None, config, mock_db)
-    log_test("Price >= +1.5R (Ratchet Active)", risk_module.active_positions["HOOD"]['stop_loss'] == 100.0, "Stop moved to Breakeven $100.00")
-    mock_db.update_stop_loss.assert_called_with("HOOD", 100.0)
+    # Step B: Price moves to 101.55 (>= +1.5R). 33% Partial scale MUST trigger!
+    with patch("app.execution.risk.route_rh_market_order", new_callable=AsyncMock) as mock_rh_order:
+        await risk_module.check_and_execute_exit("HOOD", 101.55, now_dt, None, config, mock_db)
+        pos = risk_module.active_positions["HOOD"]
+        log_test("Price >= +1.5R (Partial Scale Triggered)", pos['scaled'] is True and pos['shares'] == 6.7 and pos['stop_loss'] == 100.0, f"Sold 3.3 shs, remaining 6.7 shs, stop at BE $100.00")
+        mock_rh_order.assert_called_once_with("HOOD", 3.3, action="SELL")
+        mock_db.record_partial_exit.assert_called_once()
 
-    # Step C: Price collapses back down to 99.98 (hit breakeven stop). Must exit as BREAKEVEN with $0 loss.
+    # Step C: Price collapses back down to 99.98 (hit breakeven stop). Must exit remaining 6.7 shares as PARTIAL_1.5R_AND_BE with positive profit.
     with patch("app.execution.risk.route_rh_market_order", new_callable=AsyncMock) as mock_rh_order:
         await risk_module.check_and_execute_exit("HOOD", 99.98, now_dt, None, config, mock_db)
         log_test("Exit at Breakeven Triggered", "HOOD" not in risk_module.active_positions, "Position closed successfully")
-        mock_rh_order.assert_called_once_with("HOOD", 10.0, action="SELL")
+        mock_rh_order.assert_called_once_with("HOOD", 6.7, action="SELL")
         mock_db.close_position.assert_called_once()
         _, kwargs = mock_db.close_position.call_args
-        log_test("Exit Reason Labeling", kwargs.get('exit_reason') == 'BREAKEVEN', f"Exit reason is {kwargs.get('exit_reason')}")
+        log_test("Exit Reason Labeling", kwargs.get('exit_reason') == 'PARTIAL_1.5R_AND_BE', f"Exit reason is {kwargs.get('exit_reason')}")
+        log_test("Net Trade PnL is Positive", kwargs.get('realized_pnl', 0) > 0, f"Realized PnL: ${kwargs.get('realized_pnl'):+.2f}")
+
+    # Step D: Verify Runner Target Scenario (+4.0R)
+    risk_module.active_positions["NVDL"] = {
+        'shares': 6.7,
+        'orig_shares': 10.0,
+        'entry_price': 100.0,
+        'stop_loss': 100.0,
+        'target': 104.0,
+        'unit': 3.0,
+        'entry_time': now_dt,
+        'scaled': True,
+        'scaled_shares': 3.3,
+        'scaled_price': 101.50,
+        'scaled_pnl': 4.95
+    }
+    mock_db.reset_mock()
+    with patch("app.execution.risk.route_rh_market_order", new_callable=AsyncMock) as mock_rh_order:
+        await risk_module.check_and_execute_exit("NVDL", 104.05, now_dt, None, config, mock_db)
+        log_test("Runner Target (+4.0R) Exit Triggered", "NVDL" not in risk_module.active_positions, "Position closed successfully")
+        mock_rh_order.assert_called_once_with("NVDL", 6.7, action="SELL")
+        mock_db.close_position.assert_called_once()
+        _, kwargs = mock_db.close_position.call_args
+        log_test("Runner Exit Reason Labeling", kwargs.get('exit_reason') == 'PARTIAL_AND_RUNNER_4.0R', f"Exit reason: {kwargs.get('exit_reason')}")
+        log_test("Runner Trade PnL (+3.18R Total)", kwargs.get('realized_pnl', 0) >= 30.0, f"Realized PnL: ${kwargs.get('realized_pnl'):+.2f}")
 
 
 async def test_cash_account_daily_limit():
-    print("\n--- 4. Testing 1-Trade-Per-Day Cash Account Constraint ---")
+    print("\n--- 4. Testing 2-Trades-Per-Day Cash Account Constraint (Route 1) ---")
     config = {
         'risk_management': {
-            'max_trades_per_day': 1,
-            'risk_pct_per_trade': 0.10,
-            'max_risk_dollars': 50.0
+            'max_trades_per_day': 2,
+            'risk_pct_per_trade': 0.02,
+            'max_risk_dollars': 20.0,
+            'enable_partial_scale': True,
+            'runner_r': 4.0
         },
         'execution': {
             'morning_cutoff': '10:45',
@@ -169,19 +222,25 @@ async def test_cash_account_daily_limit():
     risk_module.active_positions.clear()
     risk_module.rejected_cooldowns.clear()
 
-    with patch("app.execution.risk.get_rh_buying_power", return_value=500.0), \
+    with patch("app.execution.risk.get_rh_buying_power", return_value=1000.0), \
          patch("app.execution.risk.route_rh_market_order", new_callable=AsyncMock) as mock_buy:
 
         # Scenario A: 0 trades today -> 1st trade is allowed
         mock_db.get_trades_count_today.return_value = 0
-        await risk_module.evaluate_setup("ARM", mock_tracker, 100.0, None, config, mock_db)
-        log_test("First Trade of the Day", "ARM" in risk_module.active_positions, "Trade 1 permitted and executed")
+        await risk_module.evaluate_setup("TSLL", mock_tracker, 100.0, None, config, mock_db)
+        log_test("First Trade of the Day", "TSLL" in risk_module.active_positions, "Trade 1 permitted and executed")
 
-        # Scenario B: Trade 1 is closed, now 1 trade completed today -> 2nd trade MUST be blocked
+        # Scenario B: Trade 1 is closed, 1 trade completed today -> 2nd trade MUST be allowed under Route 1
         risk_module.active_positions.clear()
         mock_db.get_trades_count_today.return_value = 1
-        await risk_module.evaluate_setup("AAPL", mock_tracker, 220.0, None, config, mock_db)
-        log_test("Second Trade Blocked (Limit = 1)", "AAPL" not in risk_module.active_positions and "AAPL" in risk_module.rejected_cooldowns, "Trade 2 blocked; cash account preserved")
+        await risk_module.evaluate_setup("NVDL", mock_tracker, 100.0, None, config, mock_db)
+        log_test("Second Trade of the Day (Limit = 2)", "NVDL" in risk_module.active_positions, "Trade 2 permitted and executed")
+
+        # Scenario C: Trade 2 is closed, 2 trades completed today -> 3rd trade MUST be blocked
+        risk_module.active_positions.clear()
+        mock_db.get_trades_count_today.return_value = 2
+        await risk_module.evaluate_setup("CONL", mock_tracker, 100.0, None, config, mock_db)
+        log_test("Third Trade Blocked (Limit = 2 Reached)", "CONL" not in risk_module.active_positions and "CONL" in risk_module.rejected_cooldowns, "Trade 3 blocked; cash account preserved")
 
 
 def test_config_file_integrity():
@@ -192,24 +251,32 @@ def test_config_file_integrity():
 
     max_trades = cfg.get('risk_management', {}).get('max_trades_per_day')
     ratchet = cfg.get('risk_management', {}).get('ratchet_1_5r')
+    enable_partial = cfg.get('risk_management', {}).get('enable_partial_scale')
+    partial_r = cfg.get('risk_management', {}).get('partial_scale_r')
+    partial_pct = cfg.get('risk_management', {}).get('partial_scale_pct')
+    runner_r = cfg.get('risk_management', {}).get('runner_r')
     min_close = cfg.get('execution', {}).get('min_close_pct')
     min_vol = cfg.get('execution', {}).get('min_vol_ratio')
 
     enable_chop = cfg.get('risk_management', {}).get('enable_chop_stop')
-    log_test("Config: max_trades_per_day == 1", max_trades == 1, f"Found {max_trades}")
+    log_test("Config: max_trades_per_day == 2 (Route 1)", max_trades == 2, f"Found {max_trades}")
+    log_test("Config: enable_partial_scale == True", enable_partial is True, f"Found {enable_partial}")
+    log_test("Config: partial_scale_r == 1.5", partial_r == 1.5, f"Found {partial_r}")
+    log_test("Config: partial_scale_pct == 0.33", partial_pct == 0.33, f"Found {partial_pct}")
+    log_test("Config: runner_r == 4.0", runner_r == 4.0, f"Found {runner_r}")
     log_test("Config: ratchet_1_5r == True", ratchet is True, f"Found {ratchet}")
     log_test("Config: enable_chop_stop == False (NO_CHOP_STOP Policy)", enable_chop is False, f"Found {enable_chop}")
     log_test("Config: min_close_pct == 0.60", min_close == 0.60, f"Found {min_close}")
     log_test("Config: min_vol_ratio == 0.80", min_vol == 0.80, f"Found {min_vol}")
 
     curated = set(cfg.get('universe', {}).get('curated_tickers', []))
-    expected_curated = {'CONL', 'SOXL', 'TQQQ', 'PLTR', 'RBLX', 'AMZN', 'AAPL', 'ARM'}
-    log_test("Config: curated_tickers contains Elite Universe (CONL, SOXL, TQQQ, PLTR, etc.)", curated >= expected_curated, f"Found {curated}")
+    expected_curated = {'TSLL', 'NVDL', 'CONL', 'TQQQ', 'PLTR', 'RBLX', 'AAPL', 'AMZN'}
+    log_test("Config: curated_tickers contains Elite 8 Universe", curated == expected_curated, f"Found {curated}")
 
     gate_cfg = cfg.get('market_gate', {})
     log_test("Config: market_gate.enabled == True", gate_cfg.get('enabled') is True, "Market gate active")
     log_test("Config: market_gate.require_intraday_vwap_alignment == True", gate_cfg.get('require_intraday_vwap_alignment') is True, "Intraday VWAP gate active")
-    log_test("Config: market_gate.bear_blacklist contains ARM, CONL, SOXL", set(gate_cfg.get('bear_blacklist', [])) >= {'ARM', 'CONL', 'SOXL'}, f"Found {gate_cfg.get('bear_blacklist')}")
+    log_test("Config: market_gate.bear_blacklist contains TSLL, NVDL, CONL", set(gate_cfg.get('bear_blacklist', [])) >= {'TSLL', 'NVDL', 'CONL'}, f"Found {gate_cfg.get('bear_blacklist')}")
     log_test("Config: market_gate.inverse_tickers contains PSQ", 'PSQ' in gate_cfg.get('inverse_tickers', []), f"Found {gate_cfg.get('inverse_tickers')}")
 
 
