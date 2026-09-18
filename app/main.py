@@ -23,9 +23,16 @@ async def main():
         return
         
     active_tickers = run_screener(config)
-    if not active_tickers:
-        print("No eligible tickers for today. Shutting down daemon.")
+    midday_cfg = config.get("midday_reversion", {}) if config else {}
+    midday_enabled = midday_cfg.get("enabled", False)
+
+    if not active_tickers and not midday_enabled:
+        print("No eligible tickers for today and Midday Reversion is disabled. Shutting down daemon.")
         return
+    elif not active_tickers and midday_enabled:
+        print("Notice: No morning momentum/reclaim tickers eligible today.")
+        print(f"Daemon will remain ACTIVE for Midday Mean-Reversion ({midday_cfg.get('start_time', '11:30')} - {midday_cfg.get('end_time', '13:30')}).")
+        active_tickers = []
         
     print("Authenticating Robinhood Execution Engine...")
     await login_robinhood()

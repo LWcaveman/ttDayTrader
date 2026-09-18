@@ -536,8 +536,8 @@ async def test_vwap_reclaim_risk_execution():
 def test_midday_reversion_indicator_and_filters():
     print("\n--- 11. Testing Midday Mean-Reversion Edge Filters & State Machine ---")
     
-    def create_midday_tracker():
-        t = IntradayTracker("TQQQ")
+    def create_midday_tracker(config=None):
+        t = IntradayTracker("TQQQ", config=config)
         t.is_ready = True
         t.recent_volumes = [1000.0] * 10
         t.recent_lows = [95.0, 94.8, 94.5]
@@ -617,6 +617,50 @@ def test_midday_reversion_indicator_and_filters():
     t._finalize_candle()
     sig = t.check_midday_reversion()
     log_test("Bearish Candle Rejection (Close < Open)", sig is None, "Rejected red flush candle")
+
+    # Scenario F: Prior Candle Pierced Lower Band (Validates Issue C fix)
+    t = create_midday_tracker()
+    t.last_candle_low = 94.2   # Prior candle T-1 pierced lower band (94.2 <= 95.0)
+    t.last_candle_close = 95.0
+    t.current_open = 95.4
+    t.current_high = 96.5
+    t.current_low = 95.2       # Current candle low is ABOVE 95.0, but prior pierced
+    t.current_close = 96.2      # Bullish hammer/reversal
+    t.current_vol = 500.0
+    t._finalize_candle()
+    sig = t.check_midday_reversion()
+    log_test("Prior Candle Piercing Acceptance (T-1 Pierced, T Stayed Above)", sig is not None and sig['entry_price'] == 96.2, "Prior candle piercing recognized properly via prev_completed_low")
+
+    # Scenario G: Dynamic Config Parameter Adoption (Validates Issue D fix)
+    custom_cfg = {'midday_reversion': {'adx_max': 30.0, 'sd_mult': 2.0}}
+    t = create_midday_tracker(config=custom_cfg)
+    t.adx_5m = 28.0            # 28.0 is rejected under default 25.0, but accepted under custom 30.0
+    t.current_open = 95.8
+    t.current_high = 96.2
+    t.current_low = 94.5
+    t.current_close = 96.0
+    t.current_vol = 500.0
+    t._finalize_candle()
+    sig = t.check_midday_reversion(config=custom_cfg)
+    log_test("Dynamic Config Parameter Adoption (ADX Max 30.0 accepted)", sig is not None, f"Custom config adx_max=30.0 respected (signal={sig is not None})")
+
+    # Scenario H: Pre-market Boot 5m ADX Calculation (Validates Issue A fix)
+    from datetime import timedelta
+    import pandas as pd
+    t_boot = IntradayTracker("TQQQ")
+    yesterday = datetime.now(pytz.timezone('America/New_York')).date() - timedelta(days=1)
+    dates = pd.date_range(end=pd.Timestamp(yesterday, tz='America/New_York').replace(hour=16, minute=0), periods=200, freq='5min')
+    mock_df = pd.DataFrame({
+        'Open': [100.0 + i*0.1 for i in range(200)],
+        'High': [100.5 + i*0.1 for i in range(200)],
+        'Low': [99.5 + i*0.1 for i in range(200)],
+        'Close': [100.2 + i*0.1 for i in range(200)],
+        'Volume': [1000.0] * 200
+    }, index=dates)
+
+    with patch("yfinance.download", return_value=mock_df):
+        boot_res = t_boot.bootstrap_today()
+    log_test("Pre-market 5m ADX Bootstrap (today_df is empty)", boot_res is True and t_boot.adx_5m > 0 and len(t_boot.bars_5m_history) > 0, f"Boot Success: {boot_res} | Pre-market ADX: {t_boot.adx_5m:.2f} | 5m Bars Seeded: {len(t_boot.bars_5m_history)}")
 
 
 async def test_midday_reversion_risk_and_exits():

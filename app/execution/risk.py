@@ -96,7 +96,11 @@ async def evaluate_setup(ticker, tracker, current_price, prod_session, config, d
         stop_loss = current_price - (unit / 3.0)
 
     # FETCH LIVE BALANCE FROM ROBINHOOD
-    raw_buying_power = await get_rh_buying_power()
+    try:
+        raw_buying_power = await get_rh_buying_power()
+    except Exception as e:
+        print(f"[{ticker}] CRITICAL: Failed to query Robinhood buying power: {e}. Aborting setup.")
+        return
     buying_power = raw_buying_power * 0.95 
 
     trades_today = await db.get_trades_count_today()

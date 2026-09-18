@@ -13,8 +13,8 @@ from app.execution.risk import (
 )
 from app.scanner.premarket import is_within_trading_window
 
-def _bootstrap_single_tracker(ticker):
-    tracker = IntradayTracker(ticker)
+def _bootstrap_single_tracker(ticker, config=None):
+    tracker = IntradayTracker(ticker, config=config)
     if tracker.bootstrap_today():
         return tracker
     return None
@@ -51,7 +51,7 @@ async def start_market_stream(prod_session, cert_session, active_tickers, config
     loop = asyncio.get_running_loop()
     with concurrent.futures.ThreadPoolExecutor(max_workers=20) as pool:
         futures = [
-            loop.run_in_executor(pool, _bootstrap_single_tracker, ticker)
+            loop.run_in_executor(pool, _bootstrap_single_tracker, ticker, config)
             for ticker in monitored_tickers
         ]
         
@@ -88,15 +88,18 @@ async def start_market_stream(prod_session, cert_session, active_tickers, config
 
             # 1. Exit Evaluation (Now passing prod_session and tracker)
             if ticker in active_positions:
-                await check_and_execute_exit(
-                    ticker=ticker,
-                    current_price=price,
-                    current_dt=now_dt,
-                    prod_session=prod_session,
-                    config=config,
-                    db=db,
-                    tracker=tracker
-                )
+                try:
+                    await check_and_execute_exit(
+                        ticker=ticker,
+                        current_price=price,
+                        current_dt=now_dt,
+                        prod_session=prod_session,
+                        config=config,
+                        db=db,
+                        tracker=tracker
+                    )
+                except Exception as e:
+                    print(f"[{ticker}] ERROR in check_and_execute_exit: {e}")
                 continue
 
             # 2. Entry Evaluation (Now passing prod_session)
@@ -118,16 +121,19 @@ async def start_market_stream(prod_session, cert_session, active_tickers, config
                                     continue
 
                         print(f"[VWAP RECLAIM DETECTED] {ticker} | Price: {price:.2f} | VWAP: {tracker.vwap:.2f} | Sweep Low: {reclaim_sig['sweep_low']:.2f}")
-                        await evaluate_setup(
-                            ticker=ticker,
-                            tracker=tracker,
-                            current_price=price,
-                            prod_session=prod_session,
-                            config=config,
-                            db=db,
-                            strategy='VWAP_RECLAIM',
-                            reclaim_info=reclaim_sig
-                        )
+                        try:
+                            await evaluate_setup(
+                                ticker=ticker,
+                                tracker=tracker,
+                                current_price=price,
+                                prod_session=prod_session,
+                                config=config,
+                                db=db,
+                                strategy='VWAP_RECLAIM',
+                                reclaim_info=reclaim_sig
+                            )
+                        except Exception as e:
+                            print(f"[{ticker}] ERROR evaluating VWAP Reclaim setup: {e}")
                 else:
                     min_close = float(config.get('execution', {}).get('min_close_pct', 0.60))
                     min_vol = float(config.get('execution', {}).get('min_vol_ratio', 0.80))
@@ -153,15 +159,18 @@ async def start_market_stream(prod_session, cert_session, active_tickers, config
                                         continue
 
                         print(f"[CROSS DETECTED] {ticker} | Price: {price:.2f} | VWAP: {tracker.vwap:.2f} | 9EMA: {tracker.ema_9:.2f}")
-                        await evaluate_setup(
-                            ticker=ticker,
-                            tracker=tracker,
-                            current_price=price,
-                            prod_session=prod_session,
-                            config=config,
-                            db=db,
-                            strategy='MORNING_MOMENTUM'
-                        )
+                        try:
+                            await evaluate_setup(
+                                ticker=ticker,
+                                tracker=tracker,
+                                current_price=price,
+                                prod_session=prod_session,
+                                config=config,
+                                db=db,
+                                strategy='MORNING_MOMENTUM'
+                            )
+                        except Exception as e:
+                            print(f"[{ticker}] ERROR evaluating Morning Momentum setup: {e}")
 
             # 3. Midday Mean-Reversion Entry Evaluation (Engine 2: 11:30 - 13:30)
             if midday_enabled and is_within_trading_window(config, strategy='MIDDAY_REVERSION') and len(active_positions) < 1:
@@ -169,13 +178,16 @@ async def start_market_stream(prod_session, cert_session, active_tickers, config
                     midday_sig = tracker.check_midday_reversion(config=config)
                     if midday_sig:
                         print(f"[MIDDAY REVERSION DETECTED] {ticker} | Price: {price:.2f} | VWAP: {tracker.vwap:.2f} | -2.5SD: {tracker.vwap_lower_2_5sd:.2f} | Flush Low: {midday_sig['flush_low']:.2f}")
-                        await evaluate_setup(
-                            ticker=ticker,
-                            tracker=tracker,
-                            current_price=price,
-                            prod_session=prod_session,
-                            config=config,
-                            db=db,
-                            strategy='MIDDAY_REVERSION',
-                            midday_info=midday_sig
-                        )
+                        try:
+                            await evaluate_setup(
+                                ticker=ticker,
+                                tracker=tracker,
+                                current_price=price,
+                                prod_session=prod_session,
+                                config=config,
+                                db=db,
+                                strategy='MIDDAY_REVERSION',
+                                midday_info=midday_sig
+                            )
+                        except Exception as e:
+                            print(f"[{ticker}] ERROR evaluating Midday Reversion setup: {e}")
