@@ -21,6 +21,9 @@ execution:
   min_close_pct: 0.60          # Bullish close filter: upper 40% of 1m candle
   min_vol_ratio: 0.80          # Volume check: >= 0.8x 10-bar SMA
 
+regime_routing:
+  enabled: true                # Bull (QQQ > 50 EMA) -> Late Entry Momentum; Bear (QQQ <= 50 EMA) -> Morning VWAP Reclaim
+
 universe:
   mode: "curated"  # "curated" or "sp500"
   curated_tickers:
@@ -32,8 +35,25 @@ universe:
     - "RBLX"   # High Momentum Sweet Spot (1.90 PF)
     - "AAPL"   # Mega-Cap Quality (1.32 PF)
     - "AMZN"   # Mega-Cap Cloud Trend (2.00 PF)
+  reclaim_tickers:
+    - "CONL"   # High-Beta Sweeper (Crypto Beta)
+    - "SOFI"   # High-Beta Sweeper (Fintech Beta)
+    - "MARA"   # High-Beta Sweeper (Mining Beta)
+    - "PLTR"   # High-Beta Sweeper (AI Growth Beta)
   require_daily_sma_pullback: true
   sma_tolerance_pct: 0.03
+
+vwap_reclaim:
+  enabled: true
+  start_time: "09:40"
+  end_time: "10:15"
+  min_sweep_bars: 2
+  min_depth_pct: 0.003
+  max_depth_pct: 0.025
+  min_close_pct: 0.60
+  min_vol_ratio: 0.80
+  min_stop_pct: 0.006
+  max_stop_pct: 0.025
 
 market_gate:
   enabled: true
@@ -50,5 +70,22 @@ market_gate:
     - "CONL"
   require_relative_strength: false
 
-
-
+midday_reversion:
+  enabled: true
+  start_time: "11:30"
+  end_time: "13:30"
+  sd_mult: 2.5
+  adx_max: 25.0
+  vol_exhaustion: true
+  target_type: "hybrid_vwap"
+  partial_pct: 0.50
+  hammer_wick_pct: 0.40
+  min_stop_pct: 0.005
+  max_stop_pct: 0.025
+  tickers:
+    - "CONL"
+    - "NVDL"
+    - "TQQQ"
+    - "SOXL"
+    - "UPRO"
+    - "BITX"

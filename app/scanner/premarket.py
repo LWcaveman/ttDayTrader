@@ -10,6 +10,16 @@ DEFAULT_CURATED_TICKERS = [
     "TSLL", "NVDL", "CONL", "TQQQ", "PLTR", "RBLX", "AAPL", "AMZN"
 ]
 
+# High-Beta Sweepers Universe for Morning VWAP Reclaim (Bear Market Regime)
+DEFAULT_RECLAIM_TICKERS = [
+    "CONL", "SOFI", "MARA", "PLTR"
+]
+
+# Leveraged ETF Universe for Midday Mean-Reversion (Engine 2)
+DEFAULT_MIDDAY_TICKERS = [
+    "CONL", "NVDL", "TQQQ", "SOXL", "UPRO", "BITX"
+]
+
 def get_curated_tickers(config=None):
     """
     Returns the curated elite day-trading universe from config.yaml,
@@ -21,6 +31,30 @@ def get_curated_tickers(config=None):
         if tickers and isinstance(tickers, list) and len(tickers) > 0:
             return [t.upper().strip() for t in tickers]
     return DEFAULT_CURATED_TICKERS
+
+def get_reclaim_tickers(config=None):
+    """
+    Returns the high-beta sweeper universe for Morning VWAP Reclaim from config.yaml,
+    falling back to DEFAULT_RECLAIM_TICKERS.
+    """
+    if config and isinstance(config, dict):
+        universe_cfg = config.get("universe", {})
+        tickers = universe_cfg.get("reclaim_tickers")
+        if tickers and isinstance(tickers, list) and len(tickers) > 0:
+            return [t.upper().strip() for t in tickers]
+    return DEFAULT_RECLAIM_TICKERS
+
+def get_midday_tickers(config=None):
+    """
+    Returns the leveraged ETF universe for Midday Mean-Reversion from config.yaml,
+    falling back to DEFAULT_MIDDAY_TICKERS.
+    """
+    if config and isinstance(config, dict):
+        midday_cfg = config.get("midday_reversion", {})
+        tickers = midday_cfg.get("tickers")
+        if tickers and isinstance(tickers, list) and len(tickers) > 0:
+            return [t.upper().strip() for t in tickers]
+    return DEFAULT_MIDDAY_TICKERS
 
 def get_sp500_tickers():
     """
@@ -92,8 +126,9 @@ def run_screener(config=None):
     """
     Scans candidate tickers to verify they closed yesterday within the 
     specified tolerance (default: 3%) of their 5 SMA or 10 SMA.
-    Enforces Market Regime filtering (blocking high-beta longs in bear markets,
-    activating inverse hedges like PSQ).
+    Enforces Market Regime filtering and Regime Routing:
+      - Bull Regime (QQQ > 50 EMA): Late Entry Morning Momentum on curated tickers
+      - Bear Regime (QQQ <= 50 EMA): Morning VWAP Reclaim on high-beta sweepers
     """
     mode = "curated"
     tolerance = 0.03
@@ -105,33 +140,59 @@ def run_screener(config=None):
         tolerance = float(univ_cfg.get("sma_tolerance_pct", 0.03))
         require_pullback = bool(univ_cfg.get("require_daily_sma_pullback", True))
 
-    if mode == "sp500":
-        universe = get_sp500_tickers()
-    else:
-        universe = get_curated_tickers(config)
-
     # 1. Market Gate Regime Evaluation
     gate_cfg = config.get("market_gate", {}) if config else {}
+    regime = "BULL"
     if gate_cfg.get("enabled", True):
         regime, qqq_close, qqq_ema = get_market_regime(config)
         reg_sym = gate_cfg.get("regime_ticker", "QQQ")
         print(f"\n[MARKET REGIME] Benchmark: {reg_sym} | Yesterday Close: ${qqq_close:.2f} | 50 EMA: ${qqq_ema:.2f} -> REGIME: {regime}")
-        
-        bear_blacklist = gate_cfg.get("bear_blacklist", ["TSLL", "NVDL", "CONL"])
-        inverse_tickers = gate_cfg.get("inverse_tickers", ["PSQ"])
-        enable_inverses = gate_cfg.get("enable_inverses_in_bear", True)
 
+    if config is not None and isinstance(config, dict):
+        config['current_regime'] = regime
+
+    routing_cfg = config.get("regime_routing", {}) if config else {}
+    regime_routing_enabled = routing_cfg.get("enabled", True)
+
+    if regime_routing_enabled:
         if regime == "BEAR":
-            universe = [t for t in universe if t not in bear_blacklist]
-            print(f"  [REGIME FILTER] Bear regime active. Blacklisted volatile mid-caps: {bear_blacklist}")
-            if enable_inverses:
-                for inv in inverse_tickers:
-                    if inv not in universe:
-                        universe.append(inv)
-                print(f"  [REGIME FILTER] Unlocked inverse hedge tickers: {inverse_tickers}")
+            universe = get_reclaim_tickers(config)
+            if config is not None and isinstance(config, dict):
+                config['active_strategy'] = "VWAP_RECLAIM"
+            print(f"  [REGIME ROUTING] Bear regime active (QQQ <= 50 EMA).")
+            print(f"  [REGIME ROUTING] Routing strictly to Engine 3: Morning VWAP Reclaim on high-beta sweepers: {', '.join(universe)}")
+            print(f"  [REGIME ROUTING] Daily SMA pullback filter bypassed for VWAP Reclaim liquidity sweeps.")
+            return universe
         else:
-            universe = [t for t in universe if t not in inverse_tickers]
-            print(f"  [REGIME FILTER] Bull regime active. Inverse tickers suppressed: {inverse_tickers}")
+            universe = get_curated_tickers(config)
+            if config is not None and isinstance(config, dict):
+                config['active_strategy'] = "MORNING_MOMENTUM"
+            print(f"  [REGIME ROUTING] Bull regime active (QQQ > 50 EMA).")
+            print(f"  [REGIME ROUTING] Routing strictly to Engine 1: Late Entry Morning Momentum on: {', '.join(universe)}")
+    else:
+        if mode == "sp500":
+            universe = get_sp500_tickers()
+        else:
+            universe = get_curated_tickers(config)
+        if config is not None and isinstance(config, dict):
+            config['active_strategy'] = "MORNING_MOMENTUM"
+
+        if gate_cfg.get("enabled", True):
+            bear_blacklist = gate_cfg.get("bear_blacklist", ["TSLL", "NVDL", "CONL"])
+            inverse_tickers = gate_cfg.get("inverse_tickers", ["PSQ"])
+            enable_inverses = gate_cfg.get("enable_inverses_in_bear", True)
+
+            if regime == "BEAR":
+                universe = [t for t in universe if t not in bear_blacklist]
+                print(f"  [REGIME FILTER] Bear regime active. Blacklisted volatile mid-caps: {bear_blacklist}")
+                if enable_inverses:
+                    for inv in inverse_tickers:
+                        if inv not in universe:
+                            universe.append(inv)
+                    print(f"  [REGIME FILTER] Unlocked inverse hedge tickers: {inverse_tickers}")
+            else:
+                universe = [t for t in universe if t not in inverse_tickers]
+                print(f"  [REGIME FILTER] Bull regime active. Inverse tickers suppressed: {inverse_tickers}")
 
     print(f"Running pre-market screener for {len(universe)} candidate tickers: {', '.join(universe)}")
 
@@ -182,11 +243,29 @@ def run_screener(config=None):
     print(f"Screener finished: {len(valid_tickers)}/{len(universe)} tickers eligible for intraday execution today.")
     return valid_tickers
 
-def is_within_trading_window(config):
+def is_within_trading_window(config, strategy=None):
     tz = pytz.timezone('America/New_York')
     now = datetime.now(tz).time()
-    
-    for window in config['execution']['trading_windows']:
+
+    strat = strategy or (config.get('active_strategy') if config else 'MORNING_MOMENTUM')
+    if strat == 'VWAP_RECLAIM':
+        v_cfg = config.get('vwap_reclaim', {}) if config else {}
+        start_str = v_cfg.get('start_time', '09:40')
+        end_str = v_cfg.get('end_time', '10:15')
+        start = datetime.strptime(start_str, "%H:%M").time()
+        end = datetime.strptime(end_str, "%H:%M").time()
+        return start <= now <= end
+
+    if strat == 'MIDDAY_REVERSION':
+        m_cfg = config.get('midday_reversion', {}) if config else {}
+        start_str = m_cfg.get('start_time', '11:30')
+        end_str = m_cfg.get('end_time', '13:30')
+        start = datetime.strptime(start_str, "%H:%M").time()
+        end = datetime.strptime(end_str, "%H:%M").time()
+        return start <= now <= end
+
+    windows = config.get('execution', {}).get('trading_windows', []) if config else []
+    for window in windows:
         start = datetime.strptime(window['start'], "%H:%M").time()
         end = datetime.strptime(window['end'], "%H:%M").time()
         if start <= now <= end:

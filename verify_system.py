@@ -267,11 +267,31 @@ def test_config_file_integrity():
     expected_curated = {'TSLL', 'NVDL', 'CONL', 'TQQQ', 'PLTR', 'RBLX', 'AAPL', 'AMZN'}
     log_test("Config: curated_tickers contains Elite 8 Universe", curated == expected_curated, f"Found {curated}")
 
+    reclaim = set(cfg.get('universe', {}).get('reclaim_tickers', []))
+    expected_reclaim = {'CONL', 'SOFI', 'MARA', 'PLTR'}
+    log_test("Config: reclaim_tickers contains Sweeper 4 Universe", reclaim == expected_reclaim, f"Found {reclaim}")
+
+    routing_cfg = cfg.get('regime_routing', {})
+    log_test("Config: regime_routing.enabled == True", routing_cfg.get('enabled') is True, "Regime routing active")
+
+    vwap_rec_cfg = cfg.get('vwap_reclaim', {})
+    log_test("Config: vwap_reclaim.enabled == True", vwap_rec_cfg.get('enabled') is True, "VWAP reclaim active")
+    log_test("Config: vwap_reclaim window is 09:40 - 10:15", vwap_rec_cfg.get('start_time') == "09:40" and vwap_rec_cfg.get('end_time') == "10:15", f"{vwap_rec_cfg.get('start_time')} - {vwap_rec_cfg.get('end_time')}")
+
     gate_cfg = cfg.get('market_gate', {})
     log_test("Config: market_gate.enabled == True", gate_cfg.get('enabled') is True, "Market gate active")
     log_test("Config: market_gate.require_intraday_vwap_alignment == True", gate_cfg.get('require_intraday_vwap_alignment') is True, "Intraday VWAP gate active")
     log_test("Config: market_gate.bear_blacklist contains TSLL, NVDL, CONL", set(gate_cfg.get('bear_blacklist', [])) >= {'TSLL', 'NVDL', 'CONL'}, f"Found {gate_cfg.get('bear_blacklist')}")
     log_test("Config: market_gate.inverse_tickers contains PSQ", 'PSQ' in gate_cfg.get('inverse_tickers', []), f"Found {gate_cfg.get('inverse_tickers')}")
+
+    midday_cfg = cfg.get('midday_reversion', {})
+    log_test("Config: midday_reversion.enabled == True", midday_cfg.get('enabled') is True, "Midday reversion active")
+    log_test("Config: midday_reversion window is 11:30 - 13:30", midday_cfg.get('start_time') == "11:30" and midday_cfg.get('end_time') == "13:30", f"{midday_cfg.get('start_time')} - {midday_cfg.get('end_time')}")
+    log_test("Config: midday_reversion sd_mult == 2.5", midday_cfg.get('sd_mult') == 2.5, f"Found {midday_cfg.get('sd_mult')}")
+    log_test("Config: midday_reversion adx_max == 25.0", midday_cfg.get('adx_max') == 25.0, f"Found {midday_cfg.get('adx_max')}")
+    expected_midday = {'CONL', 'NVDL', 'TQQQ', 'SOXL', 'UPRO', 'BITX'}
+    midday_tickers = set(midday_cfg.get('tickers', []))
+    log_test("Config: midday_reversion contains Leveraged ETF Universe", midday_tickers == expected_midday, f"Found {midday_tickers}")
 
 
 def test_market_gate_and_regime_filters():
@@ -370,6 +390,352 @@ def test_historical_replay():
     )
 
 
+def test_vwap_reclaim_indicator_and_filters():
+    print("\n--- 8. Testing VWAP Reclaim Edge Filters & State Machine ---")
+    
+    def create_tracker():
+        t = IntradayTracker("CONL")
+        t.is_ready = True
+        t.recent_volumes = [1000.0] * 10
+        t.cum_vol = 10000.0
+        t.cum_vol_x_tp = 1000000.0  # VWAP = 100.0
+        t.vwap = 100.0
+        t.bars_below_vwap = 2
+        t.sweep_low = 99.0
+        t.last_candle_close = 99.5
+        t.current_minute = datetime.now()
+        return t
+
+    # Scenario A: Valid VWAP Reclaim Setup
+    tracker = create_tracker()
+    tracker.current_high = 100.8
+    tracker.current_low = 99.8
+    tracker.current_close = 100.5
+    tracker.current_vol = 1200.0
+
+    tracker._finalize_candle()
+    sig = tracker.check_vwap_reclaim()
+    log_test("Valid VWAP Reclaim Triggered", sig is not None and sig['entry_price'] == 100.5 and sig['sweep_low'] == 99.0, f"Signal generated: Entry ${sig['entry_price']:.2f}, Sweep Low ${sig['sweep_low']:.2f}" if sig else "No signal")
+
+    # Verify signal was consumed/cleared
+    sig2 = tracker.check_vwap_reclaim()
+    log_test("VWAP Reclaim Signal Cleared (Single Trigger)", sig2 is None, "Signal consumed once")
+
+    # Scenario B: Sweep too shallow (< 0.3% depth)
+    tracker = create_tracker()
+    tracker.sweep_low = 99.85  # depth ~0.19% < 0.3%
+    tracker.current_high = 100.8
+    tracker.current_low = 99.8
+    tracker.current_close = 100.5
+    tracker.current_vol = 1200.0
+    tracker._finalize_candle()
+    sig = tracker.check_vwap_reclaim()
+    log_test("Shallow Sweep Rejection (Depth ~0.19% < 0.30%)", sig is None, "Rejected shallow dip")
+
+    # Scenario C: Sweep too deep (> 2.5% breakdown)
+    tracker = create_tracker()
+    tracker.sweep_low = 96.0  # depth ~4.0% > 2.5%
+    tracker.current_high = 100.8
+    tracker.current_low = 99.8
+    tracker.current_close = 100.5
+    tracker.current_vol = 1200.0
+    tracker._finalize_candle()
+    sig = tracker.check_vwap_reclaim()
+    log_test("Deep Breakdown Rejection (Depth ~4.0% > 2.5%)", sig is None, "Rejected breakdown flush")
+
+    # Scenario D: Reclaim candle with weak close (topping wick)
+    tracker = create_tracker()
+    tracker.current_high = 102.0
+    tracker.current_low = 100.1
+    tracker.current_close = 100.3  # close_pct = (100.3-100.1)/1.9 = 10.5%
+    tracker.current_vol = 1200.0
+    tracker._finalize_candle()
+    sig = tracker.check_vwap_reclaim()
+    log_test("Weak Close Reclaim Rejection (Close in lower 20%)", sig is None, "Rejected topping wick")
+
+
+def test_regime_routing_screener():
+    print("\n--- 9. Testing Regime Routing Screener (Bull vs Bear Engine Allocation) ---")
+    from app.scanner.premarket import run_screener
+    import pandas as pd
+
+    cfg = {
+        'regime_routing': {'enabled': True},
+        'universe': {
+            'mode': 'curated',
+            'curated_tickers': ['TSLL', 'NVDL', 'CONL', 'TQQQ', 'PLTR', 'RBLX', 'AAPL', 'AMZN'],
+            'reclaim_tickers': ['CONL', 'SOFI', 'MARA', 'PLTR'],
+            'require_daily_sma_pullback': False
+        },
+        'market_gate': {'enabled': True, 'regime_ticker': 'QQQ', 'daily_ema_period': 50}
+    }
+
+    # Scenario A: Bull Regime -> Routes to Late Entry Curated Tickers
+    fake_bull_df = pd.DataFrame({'Close': [500.0] * 49 + [510.0]}, index=pd.date_range("2026-01-01", periods=50, freq="D"))
+    with patch("yfinance.download", return_value=fake_bull_df):
+        tickers = run_screener(cfg)
+        log_test("Bull Regime Routes to Late Entry Universe", set(tickers) == {'TSLL', 'NVDL', 'CONL', 'TQQQ', 'PLTR', 'RBLX', 'AAPL', 'AMZN'} and cfg.get('active_strategy') == 'MORNING_MOMENTUM', f"Tickers: {tickers} | Strategy: {cfg.get('active_strategy')}")
+
+    # Scenario B: Bear Regime -> Routes to Morning VWAP Reclaim Sweepers
+    fake_bear_df = pd.DataFrame({'Close': [500.0] * 49 + [480.0]}, index=pd.date_range("2026-01-01", periods=50, freq="D"))
+    with patch("yfinance.download", return_value=fake_bear_df):
+        tickers = run_screener(cfg)
+        log_test("Bear Regime Routes to VWAP Reclaim Sweepers", set(tickers) == {'CONL', 'SOFI', 'MARA', 'PLTR'} and cfg.get('active_strategy') == 'VWAP_RECLAIM', f"Tickers: {tickers} | Strategy: {cfg.get('active_strategy')}")
+
+
+async def test_vwap_reclaim_risk_execution():
+    print("\n--- 10. Testing VWAP Reclaim Risk Sizing & Execution ---")
+    cfg = {
+        'risk_management': {
+            'max_trades_per_day': 1,
+            'risk_pct_per_trade': 0.02,
+            'max_risk_dollars': 20.0,
+            'enable_partial_scale': True,
+            'runner_r': 4.0
+        },
+        'vwap_reclaim': {
+            'min_stop_pct': 0.006,
+            'max_stop_pct': 0.025
+        }
+    }
+
+    mock_db = AsyncMock()
+    mock_db.get_trades_count_today.return_value = 0
+    mock_tracker = AsyncMock()
+    mock_tracker.lod = 98.0
+
+    risk_module.active_positions.clear()
+    risk_module.rejected_cooldowns.clear()
+
+    reclaim_info = {
+        'entry_price': 100.0,
+        'sweep_low': 99.0
+    }
+
+    with patch("app.execution.risk.get_rh_buying_power", return_value=1000.0), \
+         patch("app.execution.risk.route_rh_market_order", new_callable=AsyncMock) as mock_buy:
+
+        await risk_module.evaluate_setup(
+            ticker="CONL",
+            tracker=mock_tracker,
+            current_price=100.0,
+            prod_session=None,
+            config=cfg,
+            db=mock_db,
+            strategy="VWAP_RECLAIM",
+            reclaim_info=reclaim_info
+        )
+
+        pos = risk_module.active_positions.get("CONL")
+        log_test("VWAP Reclaim Position Opened", pos is not None, "Position added to active_positions")
+        log_test("VWAP Reclaim Stop & Unit Geometry", pos['stop_loss'] == 99.0 and pos['unit'] == 3.0 and pos['target'] == 104.0, f"Stop: ${pos['stop_loss']:.2f}, Unit: ${pos['unit']:.2f}, Target: ${pos['target']:.2f}")
+        log_test("Robinhood Buy Order Executed", mock_buy.called, "Order routed to Robinhood")
+
+
+def test_midday_reversion_indicator_and_filters():
+    print("\n--- 11. Testing Midday Mean-Reversion Edge Filters & State Machine ---")
+    
+    def create_midday_tracker():
+        t = IntradayTracker("TQQQ")
+        t.is_ready = True
+        t.recent_volumes = [1000.0] * 10
+        t.recent_lows = [95.0, 94.8, 94.5]
+        t.cum_vol = 10000.0
+        t.cum_vol_x_tp = 1000000.0       # VWAP = 100.0
+        t.cum_vol_x_tp2 = 100040000.0    # Var = 10004 - 10000 = 4.0 -> SD = 2.0
+        t.vwap = 100.0
+        t.vwap_sd = 2.0
+        t.vwap_lower_2_5sd = 95.0         # 100.0 - 2.5 * 2.0 = 95.0
+        t.prev_vwap = 100.0
+        t.prev_vwap_sd = 2.0
+        t.prev_vwap_lower_2_5sd = 95.0
+        t.adx_5m = 20.0                   # Non-trending (< 25.0)
+        t.last_candle_close = 95.2
+        t.last_candle_low = 94.8
+        t.last_candle_open = 95.5
+        t.current_minute = datetime.now()
+        return t
+
+    # Scenario A: Valid Midday Mean-Reversion Setup
+    t = create_midday_tracker()
+    t.current_open = 95.8
+    t.current_high = 96.2
+    t.current_low = 94.5    # pierced lower band (94.5 <= 95.0)
+    t.current_close = 96.0   # c > o, hammer wick = (95.8 - 94.5)/(96.2 - 94.5) = 1.3 / 1.7 = 76.5% >= 40%
+    t.current_vol = 500.0    # 500 < 1000 rolling SMA (exhaustion)
+    t._finalize_candle()
+    sig = t.check_midday_reversion()
+    log_test("Valid Midday Reversion Triggered", sig is not None and sig['entry_price'] == 96.0 and sig['flush_low'] == 94.5, f"Signal generated: Entry ${sig['entry_price']:.2f}, Flush Low ${sig['flush_low']:.2f}" if sig else "No signal")
+
+    # Verify single-trigger consumption
+    sig2 = t.check_midday_reversion()
+    log_test("Midday Reversion Signal Cleared (Single Trigger)", sig2 is None, "Signal consumed once")
+
+    # Scenario B: High ADX rejection (trending market, ADX = 28.0 > 25.0)
+    t = create_midday_tracker()
+    t.adx_5m = 28.0
+    t.current_open = 95.8
+    t.current_high = 96.2
+    t.current_low = 94.5
+    t.current_close = 96.0
+    t.current_vol = 500.0
+    t._finalize_candle()
+    sig = t.check_midday_reversion()
+    log_test("Trending Market Rejection (ADX 28.0 > 25.0)", sig is None, "Rejected trending market")
+
+    # Scenario C: High Volume rejection (active seller volume, 1500 >= 1000)
+    t = create_midday_tracker()
+    t.current_open = 95.8
+    t.current_high = 96.2
+    t.current_low = 94.5
+    t.current_close = 96.0
+    t.current_vol = 1500.0
+    t._finalize_candle()
+    sig = t.check_midday_reversion()
+    log_test("Volume Exhaustion Failure (Vol 1.5x SMA)", sig is None, "Rejected active selling volume")
+
+    # Scenario D: Shallow Low (no pierce of -2.5 SD, low = 95.5 > 95.0)
+    t = create_midday_tracker()
+    t.last_candle_low = 95.8
+    t.current_open = 96.2
+    t.current_high = 97.0
+    t.current_low = 95.5   # Did not reach 95.0
+    t.current_close = 96.8
+    t.current_vol = 500.0
+    t._finalize_candle()
+    sig = t.check_midday_reversion()
+    log_test("Shallow Flush Rejection (Low $95.50 > -2.5 SD $95.00)", sig is None, "Rejected shallow dip")
+
+    # Scenario E: Bearish candle rejection (c < o)
+    t = create_midday_tracker()
+    t.current_open = 96.0
+    t.current_high = 96.2
+    t.current_low = 94.5
+    t.current_close = 94.8  # Red bar
+    t.current_vol = 500.0
+    t._finalize_candle()
+    sig = t.check_midday_reversion()
+    log_test("Bearish Candle Rejection (Close < Open)", sig is None, "Rejected red flush candle")
+
+
+async def test_midday_reversion_risk_and_exits():
+    print("\n--- 12. Testing Midday Mean-Reversion Risk Sizing & Hybrid Exits ---")
+    cfg = {
+        'risk_management': {
+            'max_trades_per_day': 1,
+            'risk_pct_per_trade': 0.02,
+            'max_risk_dollars': 20.0,
+            'enable_partial_scale': True,
+            'runner_r': 4.0
+        },
+        'midday_reversion': {
+            'enabled': True,
+            'sd_mult': 2.5,
+            'adx_max': 25.0,
+            'min_stop_pct': 0.005,
+            'max_stop_pct': 0.025,
+            'partial_pct': 0.50
+        }
+    }
+
+    mock_db = AsyncMock()
+    mock_db.get_trades_count_today.return_value = 0
+    mock_tracker = AsyncMock()
+    mock_tracker.lod = 94.0
+    mock_tracker.vwap = 100.0
+    mock_tracker.ema_9 = 98.0
+
+    risk_module.active_positions.clear()
+    risk_module.rejected_cooldowns.clear()
+
+    midday_info = {
+        'entry_price': 96.0,
+        'flush_low': 94.5,
+        'vwap': 100.0
+    }
+
+    # Test Entry
+    with patch("app.execution.risk.get_rh_buying_power", return_value=1000.0), \
+         patch("app.execution.risk.route_rh_market_order", new_callable=AsyncMock) as mock_buy:
+
+        await risk_module.evaluate_setup(
+            ticker="TQQQ",
+            tracker=mock_tracker,
+            current_price=96.0,
+            prod_session=None,
+            config=cfg,
+            db=mock_db,
+            strategy="MIDDAY_REVERSION",
+            midday_info=midday_info
+        )
+
+        pos = risk_module.active_positions.get("TQQQ")
+        log_test("Midday Reversion Position Opened", pos is not None, "Position added to active_positions")
+        log_test("Midday Stop & VWAP Target Geometry", pos['stop_loss'] == 94.5 and pos['target'] == 100.0 and pos['strategy'] == 'MIDDAY_REVERSION', f"Stop: ${pos['stop_loss']:.2f}, Target: ${pos['target']:.2f}, Strategy: {pos['strategy']}")
+        log_test("Robinhood Buy Order Executed", mock_buy.called, "Buy order routed")
+
+    # Test Exit Slice 1: 50% scale at 9 EMA ($98.00) & move stop to Breakeven ($96.00)
+    now_dt = datetime.now(pytz.timezone('America/New_York')).replace(hour=12, minute=15, second=0, microsecond=0)
+    with patch("app.execution.risk.route_rh_market_order", new_callable=AsyncMock) as mock_sell:
+        await risk_module.check_and_execute_exit(
+            ticker="TQQQ",
+            current_price=98.05,
+            current_dt=now_dt,
+            prod_session=None,
+            config=cfg,
+            db=mock_db,
+            tracker=mock_tracker
+        )
+        pos = risk_module.active_positions.get("TQQQ")
+        log_test("Midday 50% Scale-Out at 9 EMA Executed", pos['scaled'] is True and pos['stop_loss'] == 96.0, f"Scaled: {pos['scaled']}, Stop: ${pos['stop_loss']:.2f} (Breakeven)")
+        log_test("Robinhood Partial Sell Order Routed", mock_sell.called, "Sell order routed")
+
+    # Test Exit Slice 2: Full exit at Central VWAP ($100.00)
+    with patch("app.execution.risk.route_rh_market_order", new_callable=AsyncMock) as mock_sell_final:
+        await risk_module.check_and_execute_exit(
+            ticker="TQQQ",
+            current_price=100.05,
+            current_dt=now_dt,
+            prod_session=None,
+            config=cfg,
+            db=mock_db,
+            tracker=mock_tracker
+        )
+        pos_after = risk_module.active_positions.get("TQQQ")
+        log_test("Midday Central VWAP Runner Exit Executed", pos_after is None, "Position closed at Central VWAP")
+        log_test("DB Record Close Called with TARGET_HYBRID_VWAP", mock_db.close_position.called and mock_db.close_position.call_args[1].get('exit_reason') == "TARGET_HYBRID_VWAP", f"Exit Reason: {mock_db.close_position.call_args[1].get('exit_reason')}")
+
+    # Scenario B: Stop out at Breakeven ($96.00) after taking 50% partial
+    risk_module.active_positions["TQQQ"] = {
+        'shares': 4.9479,
+        'orig_shares': 9.8958,
+        'entry_price': 96.0,
+        'stop_loss': 96.0,  # Breakeven
+        'target': 100.0,
+        'unit': 4.5,
+        'entry_time': now_dt,
+        'scaled': True,
+        'scaled_shares': 4.9479,
+        'scaled_price': 98.05,
+        'scaled_pnl': 10.14,
+        'strategy': 'MIDDAY_REVERSION'
+    }
+    mock_db.reset_mock()
+    with patch("app.execution.risk.route_rh_market_order", new_callable=AsyncMock) as mock_sell_be:
+        await risk_module.check_and_execute_exit(
+            ticker="TQQQ",
+            current_price=95.98,
+            current_dt=now_dt,
+            prod_session=None,
+            config=cfg,
+            db=mock_db,
+            tracker=mock_tracker
+        )
+        pos_be = risk_module.active_positions.get("TQQQ")
+        log_test("Midday Stop at Breakeven Executed", pos_be is None, "Position closed at Breakeven")
+        log_test("DB Record Close Called with PARTIAL_AND_BE", mock_db.close_position.called and mock_db.close_position.call_args[1].get('exit_reason') == "PARTIAL_AND_BE", f"Exit Reason: {mock_db.close_position.call_args[1].get('exit_reason')}")
+
+
 async def run_live_connectivity_probe():
     print("\n" + "=" * 60)
     print("LIVE READ-ONLY CONNECTIVITY & AUTHENTICATION PROBE")
@@ -429,6 +795,11 @@ async def main():
     test_config_file_integrity()
     test_market_gate_and_regime_filters()
     test_historical_replay()
+    test_vwap_reclaim_indicator_and_filters()
+    test_regime_routing_screener()
+    await test_vwap_reclaim_risk_execution()
+    test_midday_reversion_indicator_and_filters()
+    await test_midday_reversion_risk_and_exits()
 
     print("\n" + "=" * 60)
     print("\033[92mALL VERIFICATION & MARKET GATE TESTS PASSED SUCCESSFULLY!\033[0m")
