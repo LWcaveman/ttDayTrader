@@ -55,6 +55,8 @@ class StateManager:
                 await db.execute('ALTER TABLE active_positions ADD COLUMN scaled_price REAL DEFAULT 0.0')
             if 'scaled_pnl' not in columns:
                 await db.execute('ALTER TABLE active_positions ADD COLUMN scaled_pnl REAL DEFAULT 0.0')
+            if 'strategy' not in columns:
+                await db.execute("ALTER TABLE active_positions ADD COLUMN strategy TEXT DEFAULT 'MORNING_MOMENTUM'")
 
             await db.execute('UPDATE active_positions SET orig_shares = shares WHERE orig_shares IS NULL')
 
@@ -108,16 +110,16 @@ class StateManager:
             ''', (amount, amount))
             await db.commit()
 
-    async def open_position(self, ticker: str, shares: float, entry_price: float, stop_loss: float, target: float, entry_time: str, orig_shares: float = None, unit: float = None):
+    async def open_position(self, ticker: str, shares: float, entry_price: float, stop_loss: float, target: float, entry_time: str, orig_shares: float = None, unit: float = None, strategy: str = 'MORNING_MOMENTUM'):
         if orig_shares is None:
             orig_shares = shares
         if unit is None:
             unit = target - entry_price
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute('''
-                INSERT INTO active_positions (ticker, shares, entry_price, stop_loss, target, entry_time, status, orig_shares, unit, scaled, scaled_shares, scaled_price, scaled_pnl)
-                VALUES (?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, 0, 0.0, 0.0, 0.0)
-            ''', (ticker, shares, entry_price, stop_loss, target, entry_time, orig_shares, unit))
+                INSERT INTO active_positions (ticker, shares, entry_price, stop_loss, target, entry_time, status, orig_shares, unit, scaled, scaled_shares, scaled_price, scaled_pnl, strategy)
+                VALUES (?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, 0, 0.0, 0.0, 0.0, ?)
+            ''', (ticker, shares, entry_price, stop_loss, target, entry_time, orig_shares, unit, strategy))
             await db.commit()
             return cursor.lastrowid
 
@@ -171,7 +173,7 @@ class StateManager:
             db.row_factory = aiosqlite.Row
             async with db.execute('''
                 SELECT id, ticker, shares, entry_price, stop_loss, target, entry_time, status,
-                       orig_shares, unit, scaled, scaled_shares, scaled_price, scaled_pnl
+                       orig_shares, unit, scaled, scaled_shares, scaled_price, scaled_pnl, strategy
                 FROM active_positions
                 WHERE status = 'OPEN'
             ''') as cursor:

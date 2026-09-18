@@ -1,11 +1,13 @@
+import numpy as np
 import pandas as pd
 import yfinance as yf
 from datetime import datetime
 import pytz
 
 class IntradayTracker:
-    def __init__(self, ticker):
+    def __init__(self, ticker, config=None):
         self.ticker = ticker
+        self.config = config or {}
         
         # Core State
         self.vwap = 0.0
@@ -17,27 +19,74 @@ class IntradayTracker:
         # Cumulative VWAP state
         self.cum_vol = 0.0
         self.cum_vol_x_tp = 0.0
+        self.cum_vol_x_tp2 = 0.0
+        self.vwap_sd = 0.0
+        self.prev_vwap_sd = 0.0
+        self.vwap_lower_2_5sd = 0.0
+        self.prev_vwap_lower_2_5sd = 0.0
         
         # Current Aggregating 1-Minute Candle
         self.current_minute = None
+        self.current_open = 0.0
         self.current_high = -float('inf')
         self.current_low = float('inf')
         self.current_close = 0.0
         self.current_vol = 0.0
 
         # Last Completed 1-Minute Candle (for edge confirmation filters)
+        self.last_candle_open = 0.0
         self.last_candle_high = 0.0
         self.last_candle_low = 0.0
         self.last_candle_close = 0.0
         self.last_candle_vol = 0.0
         self.recent_volumes = []
+        self.recent_lows = []
         
         # Daily SMA constraint variables
         self.sma_5 = 0.0
         self.sma_10 = 0.0
         
-        self.is_ready = False
+        # Morning VWAP Reclaim State Tracking
+        self.bars_below_vwap = 0
+        self.sweep_low = float('inf')
+        self.reclaim_signal = None
+
+        # Midday Mean-Reversion State Tracking
+        self.adx_5m = 20.0
+        self.midday_signal = None
+        self.bars_5m_history = []
+        self.current_5m_open = 0.0
+        self.current_5m_high = -float('inf')
+        self.current_5m_low = float('inf')
+        self.current_5m_close = 0.0
         
+        self.is_ready = False
+
+    def _compute_adx_5m(self):
+        """Computes 14-period ADX on completed 5-minute bars in bars_5m_history."""
+        if len(self.bars_5m_history) < 20:
+            return
+        try:
+            df_5m = pd.DataFrame(self.bars_5m_history)
+            h5 = df_5m['High']
+            l5 = df_5m['Low']
+            c5 = df_5m['Close']
+            c5_prev = c5.shift(1)
+            tr5 = pd.concat([h5 - l5, (h5 - c5_prev).abs(), (l5 - c5_prev).abs()], axis=1).max(axis=1)
+            up5 = h5 - h5.shift(1)
+            down5 = l5.shift(1) - l5
+            plus_dm = np.where((up5 > down5) & (up5 > 0), up5, 0.0)
+            minus_dm = np.where((down5 > up5) & (down5 > 0), down5, 0.0)
+            alpha = 1.0 / 14.0
+            atr5 = tr5.ewm(alpha=alpha, adjust=False).mean()
+            plus_di = 100.0 * (pd.Series(plus_dm, index=df_5m.index).ewm(alpha=alpha, adjust=False).mean() / atr5)
+            minus_di = 100.0 * (pd.Series(minus_dm, index=df_5m.index).ewm(alpha=alpha, adjust=False).mean() / atr5)
+            dx = 100.0 * ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan))
+            adx_series = dx.ewm(alpha=alpha, adjust=False).mean().fillna(20.0)
+            self.adx_5m = float(adx_series.iloc[-1])
+        except Exception:
+            pass
+
     def bootstrap_today(self):
         """
         Fetches today's historical 1m data up to this exact minute to align 
@@ -65,44 +114,119 @@ class IntradayTracker:
                 
             df = df.tz_convert('America/New_York')
             df['EMA_9'] = df['Close'].ewm(span=9, adjust=False).mean()
-            
+
+            # Bootstrap 5m ADX across full 5d history BEFORE checking today_df
+            # (Ensures ADX is always active during pre-market daemon boot)
+            try:
+                df_5m = df[['High', 'Low', 'Close']].resample('5min').agg({
+                    'High': 'max', 'Low': 'min', 'Close': 'last'
+                }).dropna()
+                if len(df_5m) >= 20:
+                    h5 = df_5m['High']
+                    l5 = df_5m['Low']
+                    c5 = df_5m['Close']
+                    c5_prev = c5.shift(1)
+                    tr5 = pd.concat([h5 - l5, (h5 - c5_prev).abs(), (l5 - c5_prev).abs()], axis=1).max(axis=1)
+                    up5 = h5 - h5.shift(1)
+                    down5 = l5.shift(1) - l5
+                    plus_dm = np.where((up5 > down5) & (up5 > 0), up5, 0.0)
+                    minus_dm = np.where((down5 > up5) & (down5 > 0), down5, 0.0)
+                    alpha = 1.0 / 14.0
+                    atr5 = tr5.ewm(alpha=alpha, adjust=False).mean()
+                    plus_di = 100.0 * (pd.Series(plus_dm, index=df_5m.index).ewm(alpha=alpha, adjust=False).mean() / atr5)
+                    minus_di = 100.0 * (pd.Series(minus_dm, index=df_5m.index).ewm(alpha=alpha, adjust=False).mean() / atr5)
+                    dx = 100.0 * ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan))
+                    adx_series = dx.ewm(alpha=alpha, adjust=False).mean().fillna(20.0)
+                    self.adx_5m = float(adx_series.iloc[-1])
+                    self.bars_5m_history = [
+                        {'High': float(r['High']), 'Low': float(r['Low']), 'Close': float(r['Close'])}
+                        for _, r in df_5m.iloc[-60:].iterrows()
+                    ]
+                else:
+                    self.adx_5m = 20.0
+            except Exception:
+                self.adx_5m = 20.0
+
             # Isolate Today
             today = datetime.now(pytz.timezone('America/New_York')).date()
             today_df = df[df.index.date == today].copy()
-            
+
             if today_df.empty:
                 # Pre-market or exact open. Fallback to yesterday's values
                 self.ema_9 = df['EMA_9'].iloc[-1]
                 self.prev_ema_9 = df['EMA_9'].iloc[-2] if len(df) > 1 else self.ema_9
                 self.is_ready = True
                 return True
-                
+
+            mr_cfg = self.config.get('midday_reversion', {}) if self.config else {}
+            sd_mult = float(mr_cfg.get('sd_mult', 2.5))
+
             today_df['Typical_Price'] = (today_df['High'] + today_df['Low'] + today_df['Close']) / 3.0
             today_df['Vol_x_TP'] = today_df['Typical_Price'] * today_df['Volume']
-            
+            today_df['Vol_x_TP2'] = (today_df['Typical_Price'] ** 2) * today_df['Volume']
+
             self.cum_vol = today_df['Volume'].sum()
             self.cum_vol_x_tp = today_df['Vol_x_TP'].sum()
-            
+            self.cum_vol_x_tp2 = today_df['Vol_x_TP2'].sum()
+
             self.vwap = self.cum_vol_x_tp / self.cum_vol if self.cum_vol > 0 else 0.0
+            if self.cum_vol > 0:
+                var = (self.cum_vol_x_tp2 / self.cum_vol) - (self.vwap ** 2)
+                self.vwap_sd = (max(0.0, var)) ** 0.5
+            else:
+                self.vwap_sd = 0.0
+            self.vwap_lower_2_5sd = self.vwap - (sd_mult * self.vwap_sd)
+
             self.ema_9 = today_df['EMA_9'].iloc[-1]
             self.lod = today_df['Low'].min()
-            
+
             if len(today_df) > 1:
                 self.prev_ema_9 = today_df['EMA_9'].iloc[-2]
                 prev_cum_vol = today_df['Volume'].iloc[:-1].sum()
                 prev_cum_vol_x_tp = today_df['Vol_x_TP'].iloc[:-1].sum()
+                prev_cum_vol_x_tp2 = today_df['Vol_x_TP2'].iloc[:-1].sum()
                 self.prev_vwap = prev_cum_vol_x_tp / prev_cum_vol if prev_cum_vol > 0 else 0.0
+                if prev_cum_vol > 0:
+                    prev_var = (prev_cum_vol_x_tp2 / prev_cum_vol) - (self.prev_vwap ** 2)
+                    self.prev_vwap_sd = (max(0.0, prev_var)) ** 0.5
+                else:
+                    self.prev_vwap_sd = 0.0
+                self.prev_vwap_lower_2_5sd = self.prev_vwap - (sd_mult * self.prev_vwap_sd)
             else:
                 self.prev_ema_9 = self.ema_9
                 self.prev_vwap = self.vwap
+                self.prev_vwap_sd = self.vwap_sd
+                self.prev_vwap_lower_2_5sd = self.vwap_lower_2_5sd
 
             # Populate last completed candle and rolling 10-bar volumes for edge filters
             self.recent_volumes = [float(v) for v in today_df['Volume'].iloc[-10:].tolist()]
+            self.recent_lows = [float(l) for l in today_df['Low'].iloc[-5:].tolist()]
             last_row = today_df.iloc[-1]
+            self.last_candle_open = float(last_row['Open'])
             self.last_candle_high = float(last_row['High'])
             self.last_candle_low = float(last_row['Low'])
             self.last_candle_close = float(last_row['Close'])
             self.last_candle_vol = float(last_row['Volume'])
+
+            # Bootstrap VWAP Sweep state for Morning VWAP Reclaim
+            today_df['Cum_Vol'] = today_df['Volume'].cumsum()
+            today_df['Cum_Vol_x_TP'] = today_df['Vol_x_TP'].cumsum()
+            today_df['Rolling_VWAP'] = today_df['Cum_Vol_x_TP'] / today_df['Cum_Vol']
+            
+            bars_below = 0
+            s_low = float('inf')
+            for _, r in today_df.iterrows():
+                rc = float(r['Close'])
+                rvwap = float(r['Rolling_VWAP'])
+                rl = float(r['Low'])
+                if rc < rvwap:
+                    bars_below += 1
+                    s_low = min(s_low, rl)
+                else:
+                    bars_below = 0
+                    s_low = float('inf')
+            self.bars_below_vwap = bars_below
+            self.sweep_low = s_low
 
             self.is_ready = True
             return True
@@ -123,6 +247,7 @@ class IntradayTracker:
         
         if self.current_minute is None:
             self.current_minute = tick_minute
+            self.current_open = price
             self.current_high = price
             self.current_low = price
             self.current_close = price
@@ -134,6 +259,7 @@ class IntradayTracker:
             self._finalize_candle()
             # Start new candle
             self.current_minute = tick_minute
+            self.current_open = price
             self.current_high = price
             self.current_low = price
             self.current_vol = volume
@@ -151,29 +277,181 @@ class IntradayTracker:
 
     def _finalize_candle(self):
         """Calculates indicators on the completed 1m candle."""
+        prev_completed_close = self.last_candle_close
+        prev_completed_low = self.last_candle_low
+        prev_completed_vwap = self.vwap
+        prev_completed_lower_2_5sd = self.vwap_lower_2_5sd
+
+        self.last_candle_open = getattr(self, 'current_open', self.current_close)
         self.last_candle_high = self.current_high
         self.last_candle_low = self.current_low
         self.last_candle_close = self.current_close
         self.last_candle_vol = self.current_vol
 
+        # 5m Bar Tracking for Live Intraday ADX Updates
+        if self.current_5m_open == 0.0:
+            self.current_5m_open = self.last_candle_open
+        self.current_5m_high = max(self.current_5m_high, self.last_candle_high)
+        self.current_5m_low = min(self.current_5m_low, self.last_candle_low)
+        self.current_5m_close = self.last_candle_close
+
+        minute_val = self.current_minute.minute if hasattr(self.current_minute, 'minute') else 0
+        if minute_val % 5 == 4:
+            self.bars_5m_history.append({
+                'High': self.current_5m_high,
+                'Low': self.current_5m_low,
+                'Close': self.current_5m_close
+            })
+            if len(self.bars_5m_history) > 60:
+                self.bars_5m_history.pop(0)
+            self._compute_adx_5m()
+            self.current_5m_open = 0.0
+            self.current_5m_high = -float('inf')
+            self.current_5m_low = float('inf')
+            self.current_5m_close = 0.0
+
         self.recent_volumes.append(float(self.current_vol))
         if len(self.recent_volumes) > 10:
             self.recent_volumes.pop(0)
 
+        self.recent_lows.append(float(self.current_low))
+        if len(self.recent_lows) > 5:
+            self.recent_lows.pop(0)
+
         self.prev_ema_9 = self.ema_9
         self.prev_vwap = self.vwap
+        self.prev_vwap_sd = self.vwap_sd
+        self.prev_vwap_lower_2_5sd = prev_completed_lower_2_5sd
         
-        # 1. VWAP
+        # Read Config Parameters dynamically
+        mr_cfg = self.config.get('midday_reversion', {}) if self.config else {}
+        sd_mult = float(mr_cfg.get('sd_mult', 2.5))
+        adx_max = float(mr_cfg.get('adx_max', 25.0))
+        hammer_wick_pct = float(mr_cfg.get('hammer_wick_pct', 0.40))
+
+        vr_cfg = self.config.get('vwap_reclaim', {}) if self.config else {}
+        min_depth = float(vr_cfg.get('min_depth_pct', 0.003))
+        max_depth = float(vr_cfg.get('max_depth_pct', 0.025))
+        min_close = float(vr_cfg.get('min_close_pct', 0.60))
+        min_vol_r = float(vr_cfg.get('min_vol_ratio', 0.80))
+
+        # 1. VWAP & SD
         tp = (self.current_high + self.current_low + self.current_close) / 3.0
         self.cum_vol += self.current_vol
         self.cum_vol_x_tp += (tp * self.current_vol)
+        self.cum_vol_x_tp2 += ((tp ** 2) * self.current_vol)
         
         if self.cum_vol > 0:
             self.vwap = self.cum_vol_x_tp / self.cum_vol
+            var = (self.cum_vol_x_tp2 / self.cum_vol) - (self.vwap ** 2)
+            self.vwap_sd = (max(0.0, var)) ** 0.5
+            self.vwap_lower_2_5sd = self.vwap - (sd_mult * self.vwap_sd)
             
         # 2. EMA 9
         k = 2.0 / (9.0 + 1.0)
         self.ema_9 = (self.current_close - self.prev_ema_9) * k + self.prev_ema_9
+
+        # 3. Morning VWAP Reclaim State Machine
+        c = self.current_close
+        h = self.current_high
+        l = self.current_low
+        v = self.current_vol
+
+        if c < self.vwap:
+            self.bars_below_vwap += 1
+            if l < self.sweep_low:
+                self.sweep_low = l
+            self.reclaim_signal = None
+        else:
+            # Check VWAP Reclaim setup
+            if self.bars_below_vwap >= 2 and self.sweep_low < self.vwap and prev_completed_close <= prev_completed_vwap:
+                sweep_depth = (self.vwap - self.sweep_low) / self.vwap if self.vwap > 0 else 0.0
+                valid_depth = (min_depth <= sweep_depth <= max_depth)
+
+                c_range = h - l
+                close_pct = (c - l) / c_range if c_range > 0 else 0.5
+                valid_candle = (close_pct >= min_close)
+
+                vol_sma = sum(self.recent_volumes) / len(self.recent_volumes) if self.recent_volumes else 0.0
+                valid_vol = (vol_sma > 0) and (v >= min_vol_r * vol_sma)
+
+                if valid_depth and valid_candle and valid_vol:
+                    self.reclaim_signal = {
+                        'entry_price': c,
+                        'sweep_low': self.sweep_low,
+                        'bars_below_vwap': self.bars_below_vwap,
+                        'sweep_depth': sweep_depth,
+                        'minute': self.current_minute
+                    }
+                else:
+                    self.reclaim_signal = None
+            else:
+                self.reclaim_signal = None
+
+            # Reset sweep tracker once closed above VWAP
+            self.bars_below_vwap = 0
+            self.sweep_low = float('inf')
+
+        # 4. Midday Mean-Reversion State Machine
+        o = self.last_candle_open
+        lower_band = self.vwap_lower_2_5sd
+        prev_lower_band = self.prev_vwap_lower_2_5sd
+
+        # Setup Condition: Price pierced below lower band on current or previous candle
+        pierced = (l <= lower_band) or (prev_completed_low <= prev_lower_band)
+
+        # Reversal Candle Logic
+        rng = h - l
+        is_bullish = c > o
+        is_hammer = (rng > 0) and is_bullish and (((min(o, c) - l) / rng) >= hammer_wick_pct)
+        is_engulf = is_bullish and (c > prev_completed_close)
+        reversal = is_hammer or is_engulf
+
+        # Volume Exhaustion Check: Selling volume dries up (v < 10-bar SMA)
+        vol_sma = sum(self.recent_volumes) / len(self.recent_volumes) if self.recent_volumes else 0.0
+        vol_exhausted = (vol_sma > 0) and (v < vol_sma)
+
+        # ADX Filter: Ensure non-trending rangebound conditions
+        rangebound = (self.adx_5m <= adx_max)
+
+        if pierced and reversal and vol_exhausted and rangebound:
+            flush_low = min(self.recent_lows[-3:]) if len(self.recent_lows) >= 3 else min(l, prev_completed_low)
+            self.midday_signal = {
+                'entry_price': c,
+                'flush_low': flush_low,
+                'vwap': self.vwap,
+                'vwap_sd': self.vwap_sd,
+                'adx_5m': self.adx_5m,
+                'minute': self.current_minute
+            }
+        else:
+            self.midday_signal = None
+
+    def check_vwap_reclaim(self, config=None):
+        """
+        Returns the pending VWAP Reclaim signal if triggered on the last candle close.
+        Clears the signal upon reading so it only triggers once per setup.
+        """
+        if config:
+            self.config = config
+        if self.reclaim_signal is not None:
+            sig = self.reclaim_signal
+            self.reclaim_signal = None
+            return sig
+        return None
+
+    def check_midday_reversion(self, config=None):
+        """
+        Returns the pending Midday Mean-Reversion signal if triggered on the last candle close.
+        Clears the signal upon reading so it only triggers once per setup.
+        """
+        if config:
+            self.config = config
+        if self.midday_signal is not None:
+            sig = self.midday_signal
+            self.midday_signal = None
+            return sig
+        return None
 
     def check_crossover(self, current_price, min_close_pct=0.60, min_vol_ratio=0.80):
         """

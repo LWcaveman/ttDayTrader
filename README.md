@@ -35,29 +35,48 @@ The system utilizes **Tastytrade's DXLink WebSocket** feed for high-precision re
 
 ---
 
-## Trading Strategy & Logic
+## Trading Strategy & Regime-Routed Architecture
 
-### 1. Pre-Market Universe Screener
-- **Universe Modes**: Curated list (`ARM`, `HOOD`, `PLTR`, `AMZN`, `AAPL`, `GOOGL`) or full S&P 500 constituents.
-- **Daily SMA Pullback**: Requires candidate tickers to have closed the prior session within a configurable tolerance (default `3%`) of their 5-day or 10-day daily Simple Moving Average.
+The daemon dynamically routes to the highest-performing quantitative strategy based on the macro market regime (QQQ 50-day EMA) and time of day:
 
-### 2. Intraday Setup (The "Fashionably Late" Setup)
-- **Trading Window**: Operates between **10:00 AM and 1:30 PM EST** to bypass the opening 30-minute volatility.
-- **Trigger**: 9 EMA crosses above VWAP on 1-minute aggregated bars where current price > Low of Day (LOD).
-- **Midday Tight Filter**: For entries after **10:45 AM EST**, the entry unit distance `(Entry - LOD) / Entry` must not exceed `0.75%` to prevent entering overextended moves.
+### 1. Multi-Engine Strategy Architecture
+- **Engine 1: Late Entry Morning Momentum (Bull Regime: QQQ > 50 EMA)**:
+  - **Universe**: `TSLL`, `NVDL`, `CONL`, `TQQQ`, `PLTR`, `RBLX`, `AAPL`, `AMZN`
+  - **Execution Window**: 10:00 AM to 10:45 AM EST
+  - **Signal Trigger**: 9 EMA crosses above VWAP on 1-minute bars with upward sloping EMA 9, daily 5/10 SMA pullback within 3%, upper 40% bullish candle close (`min_close_pct: 0.60`), and volume >= 0.8x 10-bar SMA.
+- **Engine 3: Morning VWAP Reclaim (Bear Regime: QQQ <= 50 EMA)**:
+  - **Universe**: `CONL`, `SOFI`, `MARA`, `PLTR` (High-Beta Liquidity Sweepers)
+  - **Execution Window**: 09:40 AM to 10:15 AM EST
+  - **Signal Trigger**: Intraday liquidity flush below VWAP (at least 2 consecutive 1m bars, dip depth between 0.3% and 2.5%), followed by a strong reclaim candle closing back above VWAP with upper 40% candle close (`min_close_pct: 0.60`) and volume >= 0.8x 10-bar SMA.
+- **Engine 2: Midday Mean-Reversion (Leveraged 2x/3x ETF Washouts)**:
+  - **Universe**: `CONL`, `NVDL`, `TQQQ`, `SOXL`, `UPRO`, `BITX`
+  - **Execution Window**: 11:30 AM to 1:30 PM EST
+  - **Signal Trigger**: Panic washouts piercing -2.5 SD below VWAP (`VWAP - 2.5 * VWAP_SD`) during rangebound midday conditions (5m ADX <= 25.0) with seller exhaustion (`Volume < 10-bar SMA`) and a bullish reversal candle (Hammer wick >= 40% or Bullish Engulfing).
+  - **Exit Architecture**: Hybrid 9 EMA + Central VWAP (50% partial exit at 9 EMA $\rightarrow$ stop ratchets to Breakeven $\rightarrow$ runner exits at Central VWAP).
 
-### 3. Risk Management & Position Sizing
-- **Risk Unit**: `Unit = Entry Price - LOD`.
-- **Target (3R)**: `Entry + Unit` (equivalent to 3x the stop distance).
-- **Stop Loss**: `Entry - (Unit / 3.0)` (1/3 of the Unit distance, creating an asymmetrical 3:1 reward-to-risk ratio).
-- **Sizing**: Sized using `min(buying_power * risk_pct, max_risk)` (e.g. 2% account equity, capped at $10 max risk per trade).
-- **Daily Trade Limit**: Enforces a strict maximum number of trades per day (default `1 trade/day`).
+### 2. Intraday Index Gate Alignment
+- Long setups for morning strategies require the intraday benchmark **SPY to be trading at or above its intraday VWAP** (`SPY >= VWAP`), confirming positive market tide.
+- Midday Mean-Reversion operates independently on individual extreme ETF washouts when ADX confirms non-trending conditions.
 
-### 4. Exit Rules
-1. **Target**: Price reaches or exceeds the 3R Target (`TARGET_3R`).
-2. **Stop Loss**: Price drops to or below the stop loss (`STOP_LOSS`).
-3. **Chop Time-Stop**: If 15 minutes elapse and price has not achieved at least 30% progress toward the target, the position is closed to prevent capital lockup (`CHOP_TIME_STOP`).
-4. **End of Day**: Any remaining open position is liquidated automatically at 3:58 PM EST (`EOD_EXIT`).
+### 3. Risk Management & Sizing Geometry
+- **Stop Loss**:
+  - Late Entry Momentum: `Entry - (Unit / 3.0)` where `Unit = Entry - LOD`.
+  - VWAP Reclaim: `Entry - Clamped_Stop_Dist` (clamped between 0.6% and 2.5% of entry price based on sweep low).
+  - Midday Reversion: `Entry - Clamped_Stop_Dist` (clamped between 0.5% and 2.5% based on 3-bar flush low).
+- **Position Sizing**: Sized using `min(buying_power * risk_pct, max_risk)` / stop distance.
+- **Daily Trade Limit**: `1 trade per day` (Option B) guarantees 100% SEC / Robinhood T+1 cash settlement compliance with ZERO Good Faith Violations (GFVs). On accounts with margin, allows multiple non-overlapping trades.
+
+### 4. Exit Rules & Route 1 Partial Scaling
+1. **Engine 1 & 3 Exits**:
+   - **Partial Scale (+1.5R)**: Automatically sells 33% of the position via Robinhood and ratchets the stop loss to Breakeven (`PARTIAL_SCALE`).
+   - **Runner Target (+4.0R)**: The remaining 67% position runs toward +4.0R (`PARTIAL_AND_RUNNER_4.0R`).
+   - **Breakeven Exit**: Exits at breakeven if price pulls back to entry after partial scale (`PARTIAL_1.5R_AND_BE`).
+2. **Engine 2 Midday Exits**:
+   - **Partial Scale (9 EMA)**: Automatically sells 50% of the position at the 9 EMA and ratchets the stop loss to Breakeven.
+   - **Runner Target (Central VWAP)**: The remaining 50% position runs to Central VWAP (`TARGET_HYBRID_VWAP`).
+   - **Breakeven Exit**: Exits at breakeven if price pulls back after 9 EMA partial (`PARTIAL_AND_BE`).
+3. **Initial Stop Loss**: If trade does not reach partial profit and hits initial stop, exits at -1.0R (`STOP_LOSS`).
+4. **End of Day**: Any remaining open position liquidates automatically at 3:58 PM EST (`EOD_EXIT`).
 
 ---
 
