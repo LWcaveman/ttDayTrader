@@ -200,10 +200,10 @@ async def test_exit_execution_scenarios():
 
 
 async def test_cash_account_daily_limit():
-    print("\n--- 4. Testing 2-Trades-Per-Day Cash Account Constraint (Route 1) ---")
+    print("\n--- 4. Testing 1-Trade-Per-Day Cash Account Constraint (Option B) ---")
     config = {
         'risk_management': {
-            'max_trades_per_day': 2,
+            'max_trades_per_day': 1,
             'risk_pct_per_trade': 0.02,
             'max_risk_dollars': 20.0,
             'enable_partial_scale': True,
@@ -230,17 +230,11 @@ async def test_cash_account_daily_limit():
         await risk_module.evaluate_setup("TSLL", mock_tracker, 100.0, None, config, mock_db)
         log_test("First Trade of the Day", "TSLL" in risk_module.active_positions, "Trade 1 permitted and executed")
 
-        # Scenario B: Trade 1 is closed, 1 trade completed today -> 2nd trade MUST be allowed under Route 1
+        # Scenario B: Trade 1 is closed, 1 trade completed today -> 2nd trade MUST be blocked under Option B
         risk_module.active_positions.clear()
         mock_db.get_trades_count_today.return_value = 1
         await risk_module.evaluate_setup("NVDL", mock_tracker, 100.0, None, config, mock_db)
-        log_test("Second Trade of the Day (Limit = 2)", "NVDL" in risk_module.active_positions, "Trade 2 permitted and executed")
-
-        # Scenario C: Trade 2 is closed, 2 trades completed today -> 3rd trade MUST be blocked
-        risk_module.active_positions.clear()
-        mock_db.get_trades_count_today.return_value = 2
-        await risk_module.evaluate_setup("CONL", mock_tracker, 100.0, None, config, mock_db)
-        log_test("Third Trade Blocked (Limit = 2 Reached)", "CONL" not in risk_module.active_positions and "CONL" in risk_module.rejected_cooldowns, "Trade 3 blocked; cash account preserved")
+        log_test("Second Trade Blocked (Limit = 1 Reached)", "NVDL" not in risk_module.active_positions and "NVDL" in risk_module.rejected_cooldowns, "Trade 2 blocked; cash account preserved for overnight T+1 settlement")
 
 
 def test_config_file_integrity():
@@ -259,7 +253,7 @@ def test_config_file_integrity():
     min_vol = cfg.get('execution', {}).get('min_vol_ratio')
 
     enable_chop = cfg.get('risk_management', {}).get('enable_chop_stop')
-    log_test("Config: max_trades_per_day == 2 (Route 1)", max_trades == 2, f"Found {max_trades}")
+    log_test("Config: max_trades_per_day == 1 (Option B)", max_trades == 1, f"Found {max_trades}")
     log_test("Config: enable_partial_scale == True", enable_partial is True, f"Found {enable_partial}")
     log_test("Config: partial_scale_r == 1.5", partial_r == 1.5, f"Found {partial_r}")
     log_test("Config: partial_scale_pct == 0.33", partial_pct == 0.33, f"Found {partial_pct}")

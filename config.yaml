@@ -1,7 +1,7 @@
 risk_management:
   risk_pct_per_trade: 0.02
   max_risk_dollars: 20.00
-  max_trades_per_day: 2        # Route 1: Allows up to 2 morning trades per day for Pure Cash Account
+  max_trades_per_day: 1        # Option B: 1 high-conviction trade per day (55.4% Win Rate, 100% GFV-safe overnight settlement)
   enable_chop_stop: false      # Disabled: 2-year backtest proved letting trades run doubled +3R targets from 28 to 60
   time_stop_minutes: 0         # Disabled when enable_chop_stop is false
   chop_progress_threshold: 0.3
