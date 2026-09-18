@@ -289,6 +289,7 @@ def test_config_file_integrity():
     log_test("Config: midday_reversion window is 11:30 - 13:30", midday_cfg.get('start_time') == "11:30" and midday_cfg.get('end_time') == "13:30", f"{midday_cfg.get('start_time')} - {midday_cfg.get('end_time')}")
     log_test("Config: midday_reversion sd_mult == 2.5", midday_cfg.get('sd_mult') == 2.5, f"Found {midday_cfg.get('sd_mult')}")
     log_test("Config: midday_reversion adx_max == 25.0", midday_cfg.get('adx_max') == 25.0, f"Found {midday_cfg.get('adx_max')}")
+    log_test("Config: midday_reversion min_partial_r == 1.0", midday_cfg.get('min_partial_r') == 1.0, f"Found {midday_cfg.get('min_partial_r')}")
     expected_midday = {'CONL', 'NVDL', 'TQQQ', 'SOXL', 'UPRO', 'BITX'}
     midday_tickers = set(midday_cfg.get('tickers', []))
     log_test("Config: midday_reversion contains Leveraged ETF Universe", midday_tickers == expected_midday, f"Found {midday_tickers}")
@@ -674,8 +675,25 @@ async def test_midday_reversion_risk_and_exits():
         log_test("Midday Stop & VWAP Target Geometry", pos['stop_loss'] == 94.5 and pos['target'] == 100.0 and pos['strategy'] == 'MIDDAY_REVERSION', f"Stop: ${pos['stop_loss']:.2f}, Target: ${pos['target']:.2f}, Strategy: {pos['strategy']}")
         log_test("Robinhood Buy Order Executed", mock_buy.called, "Buy order routed")
 
-    # Test Exit Slice 1: 50% scale at 9 EMA ($98.00) & move stop to Breakeven ($96.00)
     now_dt = datetime.now(pytz.timezone('America/New_York')).replace(hour=12, minute=15, second=0, microsecond=0)
+
+    # Defensive Test: Verify NO instant 50% partial exit at entry when 9 EMA <= entry_price
+    mock_tracker.ema_9 = 95.50  # 9 EMA is BELOW entry price ($96.00)
+    with patch("app.execution.risk.route_rh_market_order", new_callable=AsyncMock) as mock_sell_early:
+        await risk_module.check_and_execute_exit(
+            ticker="TQQQ",
+            current_price=96.00,
+            current_dt=now_dt,
+            prod_session=None,
+            config=cfg,
+            db=mock_db,
+            tracker=mock_tracker
+        )
+        pos = risk_module.active_positions.get("TQQQ")
+        log_test("Midday Premature Scale Prevention (EMA <= Entry)", pos['scaled'] is False and not mock_sell_early.called, f"Scaled: {pos['scaled']}, Sell Called: {mock_sell_early.called}")
+
+    # Test Exit Slice 1: 50% scale at 9 EMA ($98.00) & move stop to Breakeven ($96.00)
+    mock_tracker.ema_9 = 98.0
     with patch("app.execution.risk.route_rh_market_order", new_callable=AsyncMock) as mock_sell:
         await risk_module.check_and_execute_exit(
             ticker="TQQQ",

@@ -203,66 +203,78 @@ async def check_and_execute_exit(ticker, current_price, current_dt, prod_session
     if pos_strategy == 'MIDDAY_REVERSION':
         m_cfg = config.get('midday_reversion', {}) if config else {}
         partial_pct = float(m_cfg.get('partial_pct', 0.50))
-        # Slice 1: Scale at 9 EMA
-        ema_target = tracker.ema_9 if (tracker and tracker.ema_9 > 0) else entry_price + (unit / 3.0 * 1.5)
+        min_partial_r = float(m_cfg.get('min_partial_r', 1.0))
+
+        # Initial 1R risk distance
+        r_unit = (unit / 3.0) if unit > 0 else (entry_price - stop_loss if entry_price > stop_loss else (target - entry_price) / 2.0)
+        min_partial = entry_price + (r_unit * min_partial_r)
+
+        # Slice 1: Scale at 9 EMA, but require at least min_partial (+1.0R) above entry
+        # to prevent instant 50% scale-out when reversal candle closes at/above the declining 9 EMA
+        if tracker and tracker.ema_9 > 0:
+            ema_target = max(tracker.ema_9, min_partial)
+        else:
+            ema_target = min_partial
+
         vwap_target = tracker.vwap if (tracker and tracker.vwap > 0) else target
 
-        if not position.get('scaled', False):
-            if current_price >= ema_target:
-                orig_shares = position.get('orig_shares', shares)
-                scale_shares = round(orig_shares * partial_pct, 4)
-                remaining_shares = round(shares - scale_shares, 4)
-
-                if scale_shares > 0 and remaining_shares > 0:
-                    print(f"[{ticker}] MIDDAY 9 EMA PARTIAL TRIGGERED: Price ${current_price:.2f} reached 9 EMA (${ema_target:.2f}). Selling {scale_shares} shares ({partial_pct*100:.0f}%)...")
-                    try:
-                        await route_rh_market_order(ticker, scale_shares, action="SELL")
-                        scale_cost = round(scale_shares * entry_price, 2)
-                        scale_proceeds = round(scale_shares * current_price, 2)
-                        scale_pnl = round(scale_proceeds - scale_cost, 2)
-
-                        position['shares'] = remaining_shares
-                        position['stop_loss'] = entry_price
-                        position['scaled'] = True
-                        position['scaled_shares'] = scale_shares
-                        position['scaled_price'] = current_price
-                        position['scaled_pnl'] = scale_pnl
-                        stop_loss = entry_price
-
-                        print(f"[{ticker}] MIDDAY PARTIAL EXECUTED: Sold {scale_shares} shares at ${current_price:.2f} | Scaled PnL: ${scale_pnl:+.2f}. Holding {remaining_shares} runner shares to Central VWAP (${vwap_target:.2f}). Stop moved to Breakeven (${entry_price:.2f}).")
-                        try:
-                            await db.record_partial_exit(
-                                ticker=ticker,
-                                scaled_shares=scale_shares,
-                                remaining_shares=remaining_shares,
-                                scaled_price=current_price,
-                                scaled_pnl=scale_pnl,
-                                new_stop_loss=entry_price
-                            )
-                        except Exception as e:
-                            print(f"[{ticker}] Warning: Failed to persist partial exit to DB: {e}")
-                    except Exception as e:
-                        print(f"[{ticker}] CRITICAL: Partial scale sell order failed: {e}. Moving stop to breakeven defensively.")
-                        position['stop_loss'] = entry_price
-                        stop_loss = entry_price
-                        try:
-                            await db.update_stop_loss(ticker, entry_price)
-                        except Exception as ex:
-                            print(f"[{ticker}] Warning: Failed to update stop to DB: {ex}")
-                else:
-                    position['stop_loss'] = entry_price
-                    stop_loss = entry_price
-                    position['scaled'] = True
-                    print(f"[{ticker}] MIDDAY RATCHET ACTIVATED (Position too small to split): Stop moved to Breakeven (${entry_price:.2f}).")
-                    try:
-                        await db.update_stop_loss(ticker, entry_price)
-                    except Exception as e:
-                        print(f"[{ticker}] Warning: Failed to persist ratcheted stop to DB: {e}")
-
+        # If price reaches Central VWAP directly, exit the entire position
         exit_reason = None
         if current_price >= vwap_target:
             exit_reason = "TARGET_HYBRID_VWAP" if position.get('scaled', False) else "TARGET_VWAP"
-        elif current_price <= stop_loss:
+        elif not position.get('scaled', False) and current_price >= ema_target:
+            orig_shares = position.get('orig_shares', shares)
+            scale_shares = round(orig_shares * partial_pct, 4)
+            remaining_shares = round(shares - scale_shares, 4)
+
+            if scale_shares > 0 and remaining_shares > 0:
+                print(f"[{ticker}] MIDDAY 9 EMA PARTIAL TRIGGERED: Price ${current_price:.2f} reached 9 EMA target (${ema_target:.2f}). Selling {scale_shares} shares ({partial_pct*100:.0f}%)...")
+                try:
+                    await route_rh_market_order(ticker, scale_shares, action="SELL")
+                    scale_cost = round(scale_shares * entry_price, 2)
+                    scale_proceeds = round(scale_shares * current_price, 2)
+                    scale_pnl = round(scale_proceeds - scale_cost, 2)
+
+                    position['shares'] = remaining_shares
+                    position['stop_loss'] = entry_price
+                    position['scaled'] = True
+                    position['scaled_shares'] = scale_shares
+                    position['scaled_price'] = current_price
+                    position['scaled_pnl'] = scale_pnl
+                    stop_loss = entry_price
+
+                    print(f"[{ticker}] MIDDAY PARTIAL EXECUTED: Sold {scale_shares} shares at ${current_price:.2f} | Scaled PnL: ${scale_pnl:+.2f}. Holding {remaining_shares} runner shares to Central VWAP (${vwap_target:.2f}). Stop moved to Breakeven (${entry_price:.2f}).")
+                    try:
+                        await db.record_partial_exit(
+                            ticker=ticker,
+                            scaled_shares=scale_shares,
+                            remaining_shares=remaining_shares,
+                            scaled_price=current_price,
+                            scaled_pnl=scale_pnl,
+                            new_stop_loss=entry_price
+                        )
+                    except Exception as e:
+                        print(f"[{ticker}] Warning: Failed to persist partial exit to DB: {e}")
+                except Exception as e:
+                    print(f"[{ticker}] CRITICAL: Partial scale sell order failed: {e}. Moving stop to breakeven defensively.")
+                    position['stop_loss'] = entry_price
+                    stop_loss = entry_price
+                    try:
+                        await db.update_stop_loss(ticker, entry_price)
+                    except Exception as ex:
+                        print(f"[{ticker}] Warning: Failed to update stop to DB: {ex}")
+            else:
+                position['stop_loss'] = entry_price
+                stop_loss = entry_price
+                position['scaled'] = True
+                print(f"[{ticker}] MIDDAY RATCHET ACTIVATED (Position too small to split): Stop moved to Breakeven (${entry_price:.2f}).")
+                try:
+                    await db.update_stop_loss(ticker, entry_price)
+                except Exception as e:
+                    print(f"[{ticker}] Warning: Failed to persist ratcheted stop to DB: {e}")
+
+        # Stop loss check (initial stop or ratcheted breakeven)
+        if not exit_reason and current_price <= stop_loss:
             exit_reason = "PARTIAL_AND_BE" if position.get('scaled', False) else "STOP_LOSS"
     else:
         rm_cfg = config.get('risk_management', {})

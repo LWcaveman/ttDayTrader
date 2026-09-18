@@ -82,6 +82,7 @@ midday_reversion:
   hammer_wick_pct: 0.40
   min_stop_pct: 0.005
   max_stop_pct: 0.025
+  min_partial_r: 1.0
   tickers:
     - "CONL"
     - "NVDL"
